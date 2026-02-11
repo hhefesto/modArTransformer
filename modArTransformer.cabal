@@ -1,0 +1,16 @@
+cabal-version: 3.0
+name:          modArTransformer
+version:       0.1.0.0
+synopsis:      A minimal transformer trained on modular arithmetic, in Haskell with hmatrix
+license:       MIT
+build-type:    Simple
+
+executable modArTransformer
+  main-is:          Main.hs
+  build-depends:    base
+                  , hmatrix
+                  , random
+                  , deepseq
+                  , vector
+  default-language: Haskell2010
+  ghc-options:      -O2 -Wall -threaded -rtsopts "-with-rtsopts=-N"

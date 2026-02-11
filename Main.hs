@@ -12,6 +12,7 @@ Key goals vs the earlier version:
   • Proper Fisher–Yates shuffle (uniform, O(n)).
   • Separate inference forward path (no training cache).
   • Much cleaner gradients accumulation and parameter updates.
+  • Checkpoint save/load for pausing and resuming training.
 
 Dependencies (common):
   • hmatrix
@@ -38,6 +39,7 @@ import           Control.Monad (forM_, when)
 import           Control.Monad.ST (runST)
 import           Data.List (foldl')
 import           Data.STRef (newSTRef, readSTRef, writeSTRef)
+import           System.Directory (doesFileExist)
 import           System.IO (hFlush, stdout)
 import           System.Random (StdGen, mkStdGen, randomR, random)
 
@@ -693,6 +695,140 @@ initTransformer vocab dModel dFF dK seed0 =
   in (params, s9)
 
 --------------------------------------------------------------------------------
+-- Checkpoint save / load
+--
+-- Format: a single text file with all parameters serialized as flat doubles.
+-- Header line: "CHECKPOINT <epoch> <seed> <vocab> <dModel> <dFF> <dK>"
+-- Remaining lines: one double per line.
+--
+-- The order of serialization must match exactly between save and load.
+--------------------------------------------------------------------------------
+
+-- | Flatten a matrix row-major into a list of doubles.
+matToList :: Mat -> [R]
+matToList m = LA.toList (LA.flatten m)
+
+-- | Rebuild a matrix from a flat list given (rows, cols).
+listToMat :: Int -> Int -> [R] -> Mat
+listToMat r c xs = (r LA.>< c) xs
+
+-- | Flatten a vector into a list of doubles.
+vecToList :: Vec -> [R]
+vecToList = LA.toList
+
+-- | Rebuild a vector from a list of doubles.
+listToVec :: [R] -> Vec
+listToVec = LA.fromList
+
+-- | Take n elements from a list, returning (taken, rest).
+takeN :: Int -> [R] -> ([R], [R])
+takeN n xs = splitAt n xs
+
+-- | Serialize LinearParams to a list of doubles.
+serializeLinear :: LinearParams -> [R]
+serializeLinear LinearParams{..} = matToList linW ++ vecToList linB
+
+-- | Deserialize LinearParams given (outDim, inDim).
+deserializeLinear :: Int -> Int -> [R] -> (LinearParams, [R])
+deserializeLinear outDim inDim xs =
+  let (wData, xs1) = takeN (outDim * inDim) xs
+      (bData, xs2) = takeN outDim xs1
+  in (LinearParams (listToMat outDim inDim wData) (listToVec bData), xs2)
+
+-- | Serialize LayerNormParams.
+serializeLN :: LayerNormParams -> [R]
+serializeLN LayerNormParams{..} = vecToList lnGamma ++ vecToList lnBeta
+
+-- | Deserialize LayerNormParams given dim.
+deserializeLN :: Int -> [R] -> (LayerNormParams, [R])
+deserializeLN d xs =
+  let (gData, xs1) = takeN d xs
+      (bData, xs2) = takeN d xs1
+  in (LayerNormParams (listToVec gData) (listToVec bData), xs2)
+
+-- | Serialize all TransformerParams to a flat list.
+serializeParams :: TransformerParams -> [R]
+serializeParams TransformerParams{..} = concat
+  [ matToList tokEmbed
+  , matToList posEmbed
+  , serializeLinear (attnWq attnParams)
+  , serializeLinear (attnWk attnParams)
+  , serializeLinear (attnWv attnParams)
+  , serializeLinear (attnWo attnParams)
+  , serializeLN ln1
+  , serializeLinear (ffnLinear1 ffnParams)
+  , serializeLinear (ffnLinear2 ffnParams)
+  , serializeLN ln2
+  , serializeLinear unembed
+  ]
+
+-- | Deserialize TransformerParams from a flat list.
+deserializeParams :: Int -> Int -> Int -> Int -> [R] -> TransformerParams
+deserializeParams vocab dModel dFF dK xs0 =
+  let (tokData, xs1)  = takeN (vocab * dModel) xs0
+      (posData, xs2)  = takeN (2 * dModel)     xs1
+      (wq,      xs3)  = deserializeLinear dK     dModel xs2
+      (wk,      xs4)  = deserializeLinear dK     dModel xs3
+      (wv,      xs5)  = deserializeLinear dK     dModel xs4
+      (wo,      xs6)  = deserializeLinear dModel  dK    xs5
+      (ln1p,    xs7)  = deserializeLN dModel xs6
+      (ff1,     xs8)  = deserializeLinear dFF    dModel xs7
+      (ff2,     xs9)  = deserializeLinear dModel  dFF   xs8
+      (ln2p,    xs10) = deserializeLN dModel xs9
+      (unemb,   _)    = deserializeLinear vocab  dModel xs10
+  in TransformerParams
+      { tokEmbed   = listToMat vocab dModel tokData
+      , posEmbed   = listToMat 2 dModel posData
+      , attnParams = AttentionParams wq wk wv wo
+      , ln1        = ln1p
+      , ffnParams  = FFNParams ff1 ff2
+      , ln2        = ln2p
+      , unembed    = unemb
+      }
+
+-- | Save a checkpoint to a file.
+-- Stores epoch, RNG seed, architecture dims, and all weights.
+saveCheckpoint :: FilePath -> TransformerParams -> Int -> Int -> Int -> Int -> Int -> Int -> IO ()
+saveCheckpoint path params epoch seed vocab dModel dFF dK = do
+  let header = unwords
+        [ "CHECKPOINT", show epoch, show seed
+        , show vocab, show dModel, show dFF, show dK
+        ]
+      doubles = serializeParams params
+      contents = unlines (header : map show doubles)
+  writeFile path contents
+  printf "  [checkpoint] Saved epoch %d to %s (%d parameters)\n" epoch path (length doubles)
+
+-- | Load a checkpoint from a file.
+-- Returns (params, epoch, seed) or Nothing if the file doesn't exist.
+loadCheckpoint :: FilePath -> IO (Maybe (TransformerParams, Int, Int))
+loadCheckpoint path = do
+  exists <- doesFileExist path
+  if not exists
+    then return Nothing
+    else do
+      contents <- readFile path
+      length contents `seq` return ()  -- force full read to release handle
+      let ls = lines contents
+      case ls of
+        [] -> return Nothing
+        (headerLine : rest) ->
+          case words headerLine of
+            ["CHECKPOINT", epochS, seedS, vocabS, dModelS, dFFS, dKS] ->
+              let epoch  = read epochS  :: Int
+                  seed   = read seedS   :: Int
+                  vocab  = read vocabS  :: Int
+                  dModel = read dModelS :: Int
+                  dFF    = read dFFS    :: Int
+                  dK     = read dKS     :: Int
+                  doubles = map read rest :: [R]
+                  params = deserializeParams vocab dModel dFF dK doubles
+              in return $ Just (params, epoch, seed)
+            _ -> do
+              putStrLn "  [checkpoint] Warning: invalid checkpoint header, ignoring."
+              return Nothing
+
+--------------------------------------------------------------------------------
 -- Data + shuffle (proper Fisher–Yates)
 --------------------------------------------------------------------------------
 
@@ -778,9 +914,11 @@ main = do
       dK        = 32
       lr        = 0.005
       wd        = 0.05
-      epochs    = 200
+      epochs    = 20000000
       trainFrac = 0.3
       seed0     = 42
+      ckptPath  = "checkpoint.ckpt"
+      ckptEvery = 1000  -- save every N epochs
 
   printf "Modulus p = %d\n" p
   printf "Model dim = %d, FFN dim = %d, Key dim = %d\n" dModel dFF dK
@@ -793,9 +931,20 @@ main = do
   let (trainData, testData, seed1) = splitData trainFrac seed0 allData
   printf "Training: %d examples, Test: %d examples\n\n" (length trainData) (length testData)
 
-  let (initParams, seed2) = initTransformer p dModel dFF dK seed1
-  putStrLn "Model initialised (Xavier). Training with SGD + weight decay."
-  putStrLn ""
+  -- Try to load an existing checkpoint
+  mCkpt <- loadCheckpoint ckptPath
+  let (initParams, startEpoch, seed2) = case mCkpt of
+        Just (ckptParams, ckptEpoch, ckptSeed) ->
+          (ckptParams, ckptEpoch + 1, ckptSeed)
+        Nothing ->
+          let (freshParams, s) = initTransformer p dModel dFF dK seed1
+          in (freshParams, 1, s)
+
+  case mCkpt of
+    Just (_, ckptEpoch, _) ->
+      printf "Resumed from checkpoint at epoch %d.\n\n" ckptEpoch
+    Nothing ->
+      putStrLn "No checkpoint found. Starting fresh (Xavier init).\n"
 
   putStrLn "Epoch | Train Loss | Train Acc | Test Acc"
   putStrLn "------+------------+-----------+---------"
@@ -809,17 +958,24 @@ main = do
                 finalTestAcc  = evaluate params testData
             printf "Final — Train: %.1f%%, Test: %.1f%%\n"
               (finalTrainAcc * 100) (finalTestAcc * 100)
+            -- Save final checkpoint (only if we actually trained)
+            when (epoch > startEpoch) $
+              saveCheckpoint ckptPath params (epoch - 1) seed p dModel dFF dK
 
         | otherwise = do
             let (!params', !avgLoss, !seed') = trainEpoch params lr wd trainData seed
 
-            when (epoch == 1 || epoch `mod` 10 == 0) $ do
+            when (epoch == startEpoch || epoch `mod` 10 == 0) $ do
               let trainAcc = evaluate params' trainData
                   testAcc  = evaluate params' testData
               printf "%5d | %10.4f | %8.1f%% | %7.1f%%\n"
                 epoch avgLoss (trainAcc * 100) (testAcc * 100)
               hFlush stdout
 
+            -- Periodic checkpoint save
+            when (epoch `mod` ckptEvery == 0) $
+              saveCheckpoint ckptPath params' epoch seed' p dModel dFF dK
+
             loop (epoch + 1) params' seed'
 
-  loop (1 :: Int) initParams seed2
+  loop startEpoch initParams seed2

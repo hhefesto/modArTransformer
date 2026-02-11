@@ -8,6 +8,7 @@ build-type:    Simple
 executable modArTransformer
   main-is:          Main.hs
   build-depends:    base
+                  , directory
                   , hmatrix
                   , random
                   , deepseq

@@ -4,27 +4,18 @@
 
 {- |
 Module      : ModularTransformer
-Description : A small, *correct* 1-layer transformer trained on (a + b) mod p.
+Description : A 1-layer transformer trained on (a + b) mod p.
 
-Key goals vs the earlier version:
-  • Correct LayerNorm backward (and we train gamma/beta).
-  • Correct attention backward (single-head, row-wise softmax).
-  • Proper Fisher–Yates shuffle (uniform, O(n)).
-  • Separate inference forward path (no training cache).
-  • Much cleaner gradients accumulation and parameter updates.
-  • Checkpoint save/load for pausing and resuming training.
+Applied changes (from the comment you posted, but keeping what compiles cleanly in hmatrix):
+  • AdamW (decoupled weight decay; no WD on bias / LayerNorm params).
+  • Learning rate schedule: linear warmup + cosine decay (per batch step).
+  • ST-based in-place accumulation for token/pos embedding gradients (avoids giant scatter lists).
+  • Checkpoint save/load:
+      - Text format (fast enough for this small model).
+      - Stores params + Adam state + timestep so schedule resumes correctly.
 
-Dependencies (common):
-  • hmatrix
-  • vector
-  • random
-
-Build (example):
-  stack ghci --package hmatrix --package vector --package random
-
-Notes:
-  • Sequence length is 2 (tokens a,b). We read out from position 0.
-  • Vocab size is p (0..p-1).
+Dependencies:
+  cabal/stack packages: hmatrix, vector, random
 -}
 
 module Main where
@@ -35,10 +26,13 @@ import           Numeric.LinearAlgebra (Matrix, Vector, R)
 import qualified Data.Vector as V
 import qualified Data.Vector.Mutable as MV
 
+import qualified Data.Vector.Storable as VS
+import qualified Data.Vector.Storable.Mutable as VSM
+
 import           Control.Monad (forM_, when)
-import           Control.Monad.ST (runST)
+import           Control.Monad.ST (ST, runST)
 import           Data.List (foldl')
-import           Data.STRef (newSTRef, readSTRef, writeSTRef)
+import           Data.STRef (newSTRef, readSTRef, writeSTRef, modifySTRef')
 import           System.Directory (doesFileExist)
 import           System.IO (hFlush, stdout)
 import           System.Random (StdGen, mkStdGen, randomR, random)
@@ -94,7 +88,11 @@ zeroLinearGrads :: Int -> Int -> LinearParams
 zeroLinearGrads outDim inDim = LinearParams (zerosM outDim inDim) (zerosV outDim)
 
 addLinear :: LinearParams -> LinearParams -> LinearParams
-addLinear (LinearParams w1 b1) (LinearParams w2 b2) = LinearParams (w1 + w2) (b1 + b2)
+addLinear (LinearParams w1 b1) (LinearParams w2 b2) =
+  LinearParams (w1 + w2) (b1 + b2)
+
+scaleLinear :: R -> LinearParams -> LinearParams
+scaleLinear s (LinearParams w b) = LinearParams (LA.scale s w) (LA.scale s b)
 
 linearForward :: LinearParams -> Vec -> Vec
 linearForward LinearParams{..} x = (linW LA.#> x) + linB
@@ -140,23 +138,19 @@ layerNormForward LayerNormParams{..} x =
   in (out, LayerNormCache xHat invS)
 
 -- Correct LN backward (per token).
--- Given upstream dout, returns (dx, dGamma, dBeta).
 layerNormBackward :: LayerNormParams -> LayerNormCache -> Vec -> (Vec, Vec, Vec)
 layerNormBackward LayerNormParams{..} LayerNormCache{..} dOut =
   let !n      = vlen dOut
       !d      = fromIntegral n
 
-      -- grads for affine
       !dBeta  = dOut
       !dGamma = dOut * lnXHat
 
-      -- back through xHat
       !dXHat  = dOut * lnGamma
 
-      !sumDXHat      = LA.sumElements dXHat
-      !sumDXHatXHat  = LA.sumElements (dXHat * lnXHat)
+      !sumDXHat     = LA.sumElements dXHat
+      !sumDXHatXHat = LA.sumElements (dXHat * lnXHat)
 
-      -- dx = (invStd / d) * (d*dXHat - sum(dXHat) - xHat*sum(dXHat*xHat))
       !term1 = LA.scale d dXHat
       !term2 = LA.konst sumDXHat n
       !term3 = lnXHat * LA.konst sumDXHatXHat n
@@ -187,28 +181,28 @@ ffnForward FFNParams{..} x =
 
 ffnBackward :: FFNParams -> Vec -> FFNCache -> Vec -> (LinearParams, LinearParams, Vec)
 ffnBackward FFNParams{..} x FFNCache{..} dOut =
-  let (g2, dAct)   = linearBackward ffnLinear2 ffnActivated dOut
-      !dH          = dAct * relu' ffnHidden
-      (g1, dX)     = linearBackward ffnLinear1 x dH
+  let (g2, dAct) = linearBackward ffnLinear2 ffnActivated dOut
+      !dH        = dAct * relu' ffnHidden
+      (g1, dX)   = linearBackward ffnLinear1 x dH
   in (g1, g2, dX)
 
 --------------------------------------------------------------------------------
--- Self-attention (single head, general n)
+-- Self-attention (single head)
 --------------------------------------------------------------------------------
 
 data AttentionParams = AttentionParams
-  { attnWq :: !LinearParams -- d_model -> d_k
-  , attnWk :: !LinearParams -- d_model -> d_k
-  , attnWv :: !LinearParams -- d_model -> d_k
-  , attnWo :: !LinearParams -- d_k     -> d_model
+  { attnWq :: !LinearParams
+  , attnWk :: !LinearParams
+  , attnWv :: !LinearParams
+  , attnWo :: !LinearParams
   }
 
 data AttentionCache = AttentionCache
-  { acQ        :: ![Vec] -- n × d_k
-  , acK        :: ![Vec] -- n × d_k
-  , acV        :: ![Vec] -- n × d_k
-  , acWeights  :: ![Vec] -- n × n (row-wise softmax)
-  , acAttended :: ![Vec] -- n × d_k (before Wo)
+  { acQ        :: ![Vec]
+  , acK        :: ![Vec]
+  , acV        :: ![Vec]
+  , acWeights  :: ![Vec]
+  , acAttended :: ![Vec]
   }
 
 attentionForward :: AttentionParams -> [Vec] -> ([Vec], AttentionCache)
@@ -220,13 +214,11 @@ attentionForward AttentionParams{..} xs =
       !dk = fromIntegral (vlen (head qs))
       !sf = 1 / sqrt dk
 
-      -- weights[i] = softmax( [q_i·k_0, ...] * sf )
       !weights =
         [ softmax $ LA.scale sf $ LA.fromList [ qi LA.<.> kj | kj <- ks ]
         | qi <- qs
         ]
 
-      -- attended[i] = Σ_j weights[i][j] * v_j
       !attended =
         [ foldl' (+) (zerosV (vlen (head vs)))
             [ LA.scale (w_i `LA.atIndex` j) (vs !! j)
@@ -246,46 +238,27 @@ data AttentionGrads = AttentionGrads
   , gWoParams :: !LinearParams
   }
 
-zeroAttentionGrads :: Int -> Int -> AttentionGrads
-zeroAttentionGrads dK dModel = AttentionGrads
-  { gWqParams = zeroLinearGrads dK dModel
-  , gWkParams = zeroLinearGrads dK dModel
-  , gWvParams = zeroLinearGrads dK dModel
-  , gWoParams = zeroLinearGrads dModel dK
-  }
-
-addAttentionGrads :: AttentionGrads -> AttentionGrads -> AttentionGrads
-addAttentionGrads a b = AttentionGrads
-  { gWqParams = addLinear (gWqParams a) (gWqParams b)
-  , gWkParams = addLinear (gWkParams a) (gWkParams b)
-  , gWvParams = addLinear (gWvParams a) (gWvParams b)
-  , gWoParams = addLinear (gWoParams a) (gWoParams b)
-  }
-
 attentionBackward
   :: AttentionParams
-  -> [Vec]             -- inputs xs
+  -> [Vec]
   -> AttentionCache
-  -> [Vec]             -- upstream gradients dOuts (wrt attention outputs)
-  -> (AttentionGrads, [Vec])  -- (grads, dXs)
+  -> [Vec]
+  -> (AttentionGrads, [Vec])
 attentionBackward AttentionParams{..} xs AttentionCache{..} dOuts =
   let !n  = length xs
       !dK = vlen (head acQ)
       !dk = fromIntegral dK
       !sf = 1 / sqrt dk
 
-      -- Back through Wo for each token: out_i = Wo(attended_i)
-      perTokWo :: [(LinearParams, Vec)] -- (gWo_i, dAttended_i)
+      perTokWo :: [(LinearParams, Vec)]
       perTokWo =
         [ linearBackward attnWo (acAttended !! i) (dOuts !! i)
         | i <- [0 .. n - 1]
         ]
 
       !gWoTotal = foldl' addLinear (zeroLinearGrads (vlen (head dOuts)) dK) (map fst perTokWo)
-      !dAttended = map snd perTokWo  -- n × dK
+      !dAttended = map snd perTokWo
 
-      -- attended_i = Σ_j alpha_i[j] * v_j
-      -- dV_j = Σ_i alpha_i[j] * dAttended_i
       !dVs =
         [ foldl' (+) (zerosV dK)
             [ LA.scale ((acWeights !! i) `LA.atIndex` j) (dAttended !! i)
@@ -294,7 +267,6 @@ attentionBackward AttentionParams{..} xs AttentionCache{..} dOuts =
         | j <- [0 .. n - 1]
         ]
 
-      -- dAlpha_i[j] = dAttended_i · v_j
       !dAlphas =
         [ LA.fromList
             [ (dAttended !! i) LA.<.> (acV !! j)
@@ -303,17 +275,11 @@ attentionBackward AttentionParams{..} xs AttentionCache{..} dOuts =
         | i <- [0 .. n - 1]
         ]
 
-      -- alpha_i = softmax(scores_i), scores_i = sf * [q_i·k_j]
-      -- dScores_i = softmaxBackward(alpha_i, dAlpha_i)
-      -- dDot_i[j] = sf * dScores_i[j]
       !dDots =
         [ LA.scale sf (softmaxBackward (acWeights !! i) (dAlphas !! i))
         | i <- [0 .. n - 1]
-        ] -- each Vec length n
+        ]
 
-      -- dot_ij = q_i · k_j
-      -- dQ_i = Σ_j dDot_ij * k_j
-      -- dK_j = Σ_i dDot_ij * q_i
       !dQs =
         [ foldl' (+) (zerosV dK)
             [ LA.scale ((dDots !! i) `LA.atIndex` j) (acK !! j)
@@ -330,7 +296,6 @@ attentionBackward AttentionParams{..} xs AttentionCache{..} dOuts =
         | j <- [0 .. n - 1]
         ]
 
-      -- Back through Q,K,V projections per token
       perTokQ = [ linearBackward attnWq (xs !! i) (dQs !! i) | i <- [0 .. n - 1] ]
       perTokK = [ linearBackward attnWk (xs !! i) (dKs !! i) | i <- [0 .. n - 1] ]
       perTokV = [ linearBackward attnWv (xs !! i) (dVs !! i) | i <- [0 .. n - 1] ]
@@ -354,36 +319,31 @@ attentionBackward AttentionParams{..} xs AttentionCache{..} dOuts =
   in (grads, dXs)
 
 --------------------------------------------------------------------------------
--- Full transformer (1 layer), seq length = 2
+-- Full transformer
 --------------------------------------------------------------------------------
 
 data TransformerParams = TransformerParams
-  { tokEmbed   :: !Mat             -- p × d_model
-  , posEmbed   :: !Mat             -- 2 × d_model
+  { tokEmbed   :: !Mat
+  , posEmbed   :: !Mat
   , attnParams :: !AttentionParams
   , ln1        :: !LayerNormParams
   , ffnParams  :: !FFNParams
   , ln2        :: !LayerNormParams
-  , unembed    :: !LinearParams    -- d_model → p
+  , unembed    :: !LinearParams
   }
 
 data ForwardCache = ForwardCache
-  { cEmbedded   :: ![Vec]              -- n × d_model
+  { cEmbedded   :: ![Vec]
   , cAttnCache  :: !AttentionCache
-  , cAttnOut    :: ![Vec]              -- n × d_model
-  , cResidual1  :: ![Vec]
   , cLn1Out     :: ![Vec]
   , cLn1Cache   :: ![LayerNormCache]
-  , cFfnOut     :: ![Vec]
   , cFfnCache   :: ![FFNCache]
-  , cResidual2  :: ![Vec]
   , cLn2Out     :: ![Vec]
   , cLn2Cache   :: ![LayerNormCache]
-  , cLogits     :: !Vec               -- p
-  , cProbs      :: !Vec               -- p
+  , cLogits     :: !Vec
+  , cProbs      :: !Vec
   }
 
--- Inference-only forward (no cache)
 forwardInfer :: TransformerParams -> Int -> Int -> Vec
 forwardInfer TransformerParams{..} tokA tokB =
   let embA = tokEmbed LA.! tokA
@@ -404,7 +364,6 @@ forwardInfer TransformerParams{..} tokA tokB =
       logits  = linearForward unembed readout
   in softmax logits
 
--- Training forward (cache everything needed for exact backprop)
 forwardTrain :: TransformerParams -> Int -> Int -> (Vec, ForwardCache)
 forwardTrain TransformerParams{..} tokA tokB =
   let embA = tokEmbed LA.! tokA
@@ -421,9 +380,9 @@ forwardTrain TransformerParams{..} tokA tokB =
       ln1Cache   = map snd ln1Pairs
 
       ffnPairs   = map (ffnForward ffnParams) ln1Out
-      ffnOut     = map fst ffnPairs
       ffnCache   = map snd ffnPairs
 
+      ffnOut     = map fst ffnPairs
       residual2  = zipWith (+) ln1Out ffnOut
       ln2Pairs   = map (layerNormForward ln2) residual2
       ln2Out     = map fst ln2Pairs
@@ -436,13 +395,9 @@ forwardTrain TransformerParams{..} tokA tokB =
       cache = ForwardCache
         { cEmbedded  = embedded
         , cAttnCache = attnCache
-        , cAttnOut   = attnOut
-        , cResidual1 = residual1
         , cLn1Out    = ln1Out
         , cLn1Cache  = ln1Cache
-        , cFfnOut    = ffnOut
         , cFfnCache  = ffnCache
-        , cResidual2 = residual2
         , cLn2Out    = ln2Out
         , cLn2Cache  = ln2Cache
         , cLogits    = logits
@@ -451,7 +406,7 @@ forwardTrain TransformerParams{..} tokA tokB =
   in (probs, cache)
 
 --------------------------------------------------------------------------------
--- Loss
+-- Loss & Per-example grads (embedding grads returned separately for ST accumulation)
 --------------------------------------------------------------------------------
 
 crossEntropyLoss :: Vec -> Int -> R
@@ -465,67 +420,93 @@ crossEntropyGradLogits probs target =
       oneHot = LA.assoc n 0 [(target, 1)]
   in probs - oneHot
 
---------------------------------------------------------------------------------
--- Backprop + gradients
---------------------------------------------------------------------------------
-
-data Gradients = Gradients
-  { gTokEmbed :: !Mat
-  , gPosEmbed :: !Mat
-  , gUnembed  :: !LinearParams
-  , gFFN1     :: !LinearParams
-  , gFFN2     :: !LinearParams
-  , gAttnWq   :: !LinearParams
-  , gAttnWk   :: !LinearParams
-  , gAttnWv   :: !LinearParams
-  , gAttnWo   :: !LinearParams
-  , gLn1Gamma :: !Vec
-  , gLn1Beta  :: !Vec
-  , gLn2Gamma :: !Vec
-  , gLn2Beta  :: !Vec
+data ExampleGrads = ExampleGrads
+  { egDX0      :: !Vec
+  , egDX1      :: !Vec
+  , egUnembed  :: !LinearParams
+  , egFFN1     :: !LinearParams
+  , egFFN2     :: !LinearParams
+  , egAttnWq   :: !LinearParams
+  , egAttnWk   :: !LinearParams
+  , egAttnWv   :: !LinearParams
+  , egAttnWo   :: !LinearParams
+  , egLn1Gamma :: !Vec
+  , egLn1Beta  :: !Vec
+  , egLn2Gamma :: !Vec
+  , egLn2Beta  :: !Vec
   }
 
-zeroGradients :: Int -> Int -> Int -> Int -> Gradients
-zeroGradients vocab dModel dFF dK = Gradients
-  { gTokEmbed = zerosM vocab dModel
-  , gPosEmbed = zerosM 2 dModel
-  , gUnembed  = zeroLinearGrads vocab dModel
-  , gFFN1     = zeroLinearGrads dFF dModel
-  , gFFN2     = zeroLinearGrads dModel dFF
-  , gAttnWq   = zeroLinearGrads dK dModel
-  , gAttnWk   = zeroLinearGrads dK dModel
-  , gAttnWv   = zeroLinearGrads dK dModel
-  , gAttnWo   = zeroLinearGrads dModel dK
-  , gLn1Gamma = zerosV dModel
-  , gLn1Beta  = zerosV dModel
-  , gLn2Gamma = zerosV dModel
-  , gLn2Beta  = zerosV dModel
-  }
+zeroExampleGrads :: Int -> Int -> Int -> Int -> ExampleGrads
+zeroExampleGrads vocab dModel dFF dK =
+  ExampleGrads
+    { egDX0      = zerosV dModel
+    , egDX1      = zerosV dModel
+    , egUnembed  = zeroLinearGrads vocab dModel
+    , egFFN1     = zeroLinearGrads dFF dModel
+    , egFFN2     = zeroLinearGrads dModel dFF
+    , egAttnWq   = zeroLinearGrads dK dModel
+    , egAttnWk   = zeroLinearGrads dK dModel
+    , egAttnWv   = zeroLinearGrads dK dModel
+    , egAttnWo   = zeroLinearGrads dModel dK
+    , egLn1Gamma = zerosV dModel
+    , egLn1Beta  = zerosV dModel
+    , egLn2Gamma = zerosV dModel
+    , egLn2Beta  = zerosV dModel
+    }
+
+addExampleGrads :: ExampleGrads -> ExampleGrads -> ExampleGrads
+addExampleGrads a b =
+  ExampleGrads
+    { egDX0      = egDX0 a + egDX0 b
+    , egDX1      = egDX1 a + egDX1 b
+    , egUnembed  = addLinear (egUnembed a) (egUnembed b)
+    , egFFN1     = addLinear (egFFN1 a) (egFFN1 b)
+    , egFFN2     = addLinear (egFFN2 a) (egFFN2 b)
+    , egAttnWq   = addLinear (egAttnWq a) (egAttnWq b)
+    , egAttnWk   = addLinear (egAttnWk a) (egAttnWk b)
+    , egAttnWv   = addLinear (egAttnWv a) (egAttnWv b)
+    , egAttnWo   = addLinear (egAttnWo a) (egAttnWo b)
+    , egLn1Gamma = egLn1Gamma a + egLn1Gamma b
+    , egLn1Beta  = egLn1Beta a + egLn1Beta b
+    , egLn2Gamma = egLn2Gamma a + egLn2Gamma b
+    , egLn2Beta  = egLn2Beta a + egLn2Beta b
+    }
+
+scaleExampleGrads :: R -> ExampleGrads -> ExampleGrads
+scaleExampleGrads s g =
+  g { egDX0      = LA.scale s (egDX0 g)
+    , egDX1      = LA.scale s (egDX1 g)
+    , egUnembed  = scaleLinear s (egUnembed g)
+    , egFFN1     = scaleLinear s (egFFN1 g)
+    , egFFN2     = scaleLinear s (egFFN2 g)
+    , egAttnWq   = scaleLinear s (egAttnWq g)
+    , egAttnWk   = scaleLinear s (egAttnWk g)
+    , egAttnWv   = scaleLinear s (egAttnWv g)
+    , egAttnWo   = scaleLinear s (egAttnWo g)
+    , egLn1Gamma = LA.scale s (egLn1Gamma g)
+    , egLn1Beta  = LA.scale s (egLn1Beta g)
+    , egLn2Gamma = LA.scale s (egLn2Gamma g)
+    , egLn2Beta  = LA.scale s (egLn2Beta g)
+    }
 
 backward
   :: TransformerParams
   -> ForwardCache
   -> Int -> Int -> Int
-  -> Gradients
-backward TransformerParams{..} cache tokA tokB target =
+  -> ExampleGrads
+backward TransformerParams{..} cache _tokA _tokB target =
   let
     !dModel = vlen (lnGamma ln1)
     !vocab  = LA.rows tokEmbed
-    !dFF    = vlen (linB (ffnLinear1 ffnParams))
-    -- !dK     = vlen (linB (attnWq attnParams))
     !n      = length (cEmbedded cache)
 
-    -- Output: CE loss on probs
     !dLogits = crossEntropyGradLogits (cProbs cache) target
-
-    -- Unembed backward: logits = W_u * readout + b_u
     !readout = head (cLn2Out cache)
     (gUnemb, dReadout) = linearBackward unembed readout dLogits
 
-    -- LN2 backward (per token). Only token 0 receives upstream gradient.
     !dLn2Outs = dReadout : replicate (n - 1) (zerosV dModel)
 
-    ln2Backs :: [(Vec, Vec, Vec)] -- (dResidual2_i, dGamma_i, dBeta_i)
+    ln2Backs :: [(Vec, Vec, Vec)]
     ln2Backs =
       [ layerNormBackward ln2 (cLn2Cache cache !! i) (dLn2Outs !! i)
       | i <- [0 .. n - 1]
@@ -535,27 +516,22 @@ backward TransformerParams{..} cache tokA tokB target =
     !gLn2G      = foldl' (+) (zerosV dModel) (map (\(_,dg,_) -> dg) ln2Backs)
     !gLn2B      = foldl' (+) (zerosV dModel) (map (\(_,_,db) -> db) ln2Backs)
 
-    -- residual2 = ln1Out + ffnOut
     !dLn1Out_from_res2 = dResidual2
     !dFfnOut           = dResidual2
 
-    -- FFN backward per token
-    ffnBacks :: [(LinearParams, LinearParams, Vec)] -- (g1_i, g2_i, dLn1Out_from_ffn_i)
+    ffnBacks :: [(LinearParams, LinearParams, Vec)]
     ffnBacks =
       [ ffnBackward ffnParams (cLn1Out cache !! i) (cFfnCache cache !! i) (dFfnOut !! i)
       | i <- [0 .. n - 1]
       ]
 
-    !gFFN1Total = foldl' addLinear (zeroLinearGrads dFF dModel) (map (\(g1,_,_) -> g1) ffnBacks)
-    !gFFN2Total = foldl' addLinear (zeroLinearGrads dModel dFF) (map (\(_,g2,_) -> g2) ffnBacks)
+    !gFFN1Total = foldl' addLinear (zeroLinearGrads (vlen (linB (ffnLinear1 ffnParams))) dModel) (map (\(g1,_,_) -> g1) ffnBacks)
+    !gFFN2Total = foldl' addLinear (zeroLinearGrads dModel (vlen (linB (ffnLinear1 ffnParams)))) (map (\(_,g2,_) -> g2) ffnBacks)
     !dLn1Out_from_ffn = map (\(_,_,dx) -> dx) ffnBacks
 
-    -- Combine gradients into LN1 output
-    !dLn1Out =
-      zipWith (+) dLn1Out_from_res2 dLn1Out_from_ffn
+    !dLn1Out = zipWith (+) dLn1Out_from_res2 dLn1Out_from_ffn
 
-    -- LN1 backward per token
-    ln1Backs :: [(Vec, Vec, Vec)] -- (dResidual1_i, dGamma_i, dBeta_i)
+    ln1Backs :: [(Vec, Vec, Vec)]
     ln1Backs =
       [ layerNormBackward ln1 (cLn1Cache cache !! i) (dLn1Out !! i)
       | i <- [0 .. n - 1]
@@ -565,103 +541,241 @@ backward TransformerParams{..} cache tokA tokB target =
     !gLn1G      = foldl' (+) (zerosV dModel) (map (\(_,dg,_) -> dg) ln1Backs)
     !gLn1B      = foldl' (+) (zerosV dModel) (map (\(_,_,db) -> db) ln1Backs)
 
-    -- residual1 = embedded + attnOut
-    !dEmbedded_from_res1 = dResidual1
     !dAttnOut            = dResidual1
 
-    -- Attention backward
     attnC = cAttnCache cache
     xs    = cEmbedded cache
     (attnGrads, dEmbedded_from_attn) =
       attentionBackward attnParams xs attnC dAttnOut
 
-    !dEmbedded = zipWith (+) dEmbedded_from_res1 dEmbedded_from_attn
+    !dEmbedded = zipWith (+) dResidual1 dEmbedded_from_attn
+    !dX0 = dEmbedded !! 0
+    !dX1 = dEmbedded !! 1
 
-    -- Scatter gradients into token/pos embeddings
-    -- embedded[0] = tokEmbed[tokA] + posEmbed[0]
-    -- embedded[1] = tokEmbed[tokB] + posEmbed[1]
-    mkScatter :: Int -> Vec -> [((Int, Int), R)]
-    mkScatter row v =
-      [ ((row, j), v `LA.atIndex` j) | j <- [0 .. vlen v - 1] ]
-
-    !gTok =
-      LA.accum (zerosM vocab dModel) (+) (mkScatter tokA (dEmbedded !! 0))
-      + LA.accum (zerosM vocab dModel) (+) (mkScatter tokB (dEmbedded !! 1))
-
-    !gPos =
-      LA.accum (zerosM 2 dModel) (+)
-        ( mkScatter 0 (dEmbedded !! 0)
-       ++ mkScatter 1 (dEmbedded !! 1)
-        )
-
-  in Gradients
-      { gTokEmbed = gTok
-      , gPosEmbed = gPos
-      , gUnembed  = gUnemb
-      , gFFN1     = gFFN1Total
-      , gFFN2     = gFFN2Total
-      , gAttnWq   = gWqParams attnGrads
-      , gAttnWk   = gWkParams attnGrads
-      , gAttnWv   = gWvParams attnGrads
-      , gAttnWo   = gWoParams attnGrads
-      , gLn1Gamma = gLn1G
-      , gLn1Beta  = gLn1B
-      , gLn2Gamma = gLn2G
-      , gLn2Beta  = gLn2B
+    !dK = LA.rows (linW (attnWq attnParams)) -- out dim of Wq
+  in ExampleGrads
+      { egDX0      = dX0
+      , egDX1      = dX1
+      , egUnembed  = gUnemb
+      , egFFN1     = gFFN1Total
+      , egFFN2     = gFFN2Total
+      , egAttnWq   = gWqParams attnGrads
+      , egAttnWk   = gWkParams attnGrads
+      , egAttnWv   = gWvParams attnGrads
+      , egAttnWo   = gWoParams attnGrads
+      , egLn1Gamma = gLn1G
+      , egLn1Beta  = gLn1B
+      , egLn2Gamma = gLn2G
+      , egLn2Beta  = gLn2B
       }
 
 --------------------------------------------------------------------------------
--- Updates (SGD + decoupled weight decay on weights/embeddings)
+-- AdamW + schedule
 --------------------------------------------------------------------------------
 
-updateMat :: R -> R -> Mat -> Mat -> Mat
-updateMat lr wd p g = p - LA.scale lr (g + LA.scale wd p)
+data MatMoments = MatMoments { mmM :: !Mat, mmV :: !Mat }
+data VecMoments = VecMoments { vmM :: !Vec, vmV :: !Vec }
 
--- Apply weight decay to W only; no decay on bias.
-updateLinear :: R -> R -> LinearParams -> LinearParams -> LinearParams
-updateLinear lr wd p g = LinearParams
-  { linW = linW p - LA.scale lr (linW g + LA.scale wd (linW p))
-  , linB = linB p - LA.scale lr (linB g)
+data LinearMoments = LinearMoments
+  { lmW :: !MatMoments
+  , lmB :: !VecMoments
   }
 
-updateLayerNorm :: R -> LayerNormParams -> (Vec, Vec) -> LayerNormParams
-updateLayerNorm lr LayerNormParams{..} (dG, dB) = LayerNormParams
-  { lnGamma = lnGamma - LA.scale lr dG
-  , lnBeta  = lnBeta  - LA.scale lr dB
+data AdamState = AdamState
+  { asTimestep :: !Int
+  , asB1Pow    :: !R
+  , asB2Pow    :: !R
+  , asTokMom   :: !MatMoments
+  , asPosMom   :: !MatMoments
+  , asWqMom    :: !LinearMoments
+  , asWkMom    :: !LinearMoments
+  , asWvMom    :: !LinearMoments
+  , asWoMom    :: !LinearMoments
+  , asLn1GMom  :: !VecMoments
+  , asLn1BMom  :: !VecMoments
+  , asFF1Mom   :: !LinearMoments
+  , asFF2Mom   :: !LinearMoments
+  , asLn2GMom  :: !VecMoments
+  , asLn2BMom  :: !VecMoments
+  , asUnMom    :: !LinearMoments
   }
 
-applyGradients :: R -> R -> TransformerParams -> Gradients -> TransformerParams
-applyGradients lr wd p g = p
-  { tokEmbed = updateMat lr wd (tokEmbed p) (gTokEmbed g)
-  , posEmbed = updateMat lr wd (posEmbed p) (gPosEmbed g)
-
-  , unembed  = updateLinear lr wd (unembed p) (gUnembed g)
-
-  , ln1      = updateLayerNorm lr (ln1 p) (gLn1Gamma g, gLn1Beta g)
-  , ln2      = updateLayerNorm lr (ln2 p) (gLn2Gamma g, gLn2Beta g)
-
-  , ffnParams = (ffnParams p)
-      { ffnLinear1 = updateLinear lr wd (ffnLinear1 (ffnParams p)) (gFFN1 g)
-      , ffnLinear2 = updateLinear lr wd (ffnLinear2 (ffnParams p)) (gFFN2 g)
-      }
-
-  , attnParams = (attnParams p)
-      { attnWq = updateLinear lr wd (attnWq (attnParams p)) (gAttnWq g)
-      , attnWk = updateLinear lr wd (attnWk (attnParams p)) (gAttnWk g)
-      , attnWv = updateLinear lr wd (attnWv (attnParams p)) (gAttnWv g)
-      , attnWo = updateLinear lr wd (attnWo (attnParams p)) (gAttnWo g)
-      }
+data AdamConfig = AdamConfig
+  { adamB1  :: !R
+  , adamB2  :: !R
+  , adamEps :: !R
+  , adamWD  :: !R
   }
+
+zeroMatMomentsLike :: Mat -> MatMoments
+zeroMatMomentsLike w = MatMoments (LA.scale 0 w) (LA.scale 0 w)
+
+zeroVecMomentsLike :: Vec -> VecMoments
+zeroVecMomentsLike v = VecMoments (LA.scale 0 v) (LA.scale 0 v)
+
+zeroLinearMomentsLike :: LinearParams -> LinearMoments
+zeroLinearMomentsLike LinearParams{..} =
+  LinearMoments (zeroMatMomentsLike linW) (zeroVecMomentsLike linB)
+
+initAdamState :: TransformerParams -> AdamState
+initAdamState p =
+  AdamState
+    { asTimestep = 0
+    , asB1Pow    = 1
+    , asB2Pow    = 1
+    , asTokMom   = zeroMatMomentsLike (tokEmbed p)
+    , asPosMom   = zeroMatMomentsLike (posEmbed p)
+    , asWqMom    = zeroLinearMomentsLike (attnWq (attnParams p))
+    , asWkMom    = zeroLinearMomentsLike (attnWk (attnParams p))
+    , asWvMom    = zeroLinearMomentsLike (attnWv (attnParams p))
+    , asWoMom    = zeroLinearMomentsLike (attnWo (attnParams p))
+    , asLn1GMom  = zeroVecMomentsLike (lnGamma (ln1 p))
+    , asLn1BMom  = zeroVecMomentsLike (lnBeta  (ln1 p))
+    , asFF1Mom   = zeroLinearMomentsLike (ffnLinear1 (ffnParams p))
+    , asFF2Mom   = zeroLinearMomentsLike (ffnLinear2 (ffnParams p))
+    , asLn2GMom  = zeroVecMomentsLike (lnGamma (ln2 p))
+    , asLn2BMom  = zeroVecMomentsLike (lnBeta  (ln2 p))
+    , asUnMom    = zeroLinearMomentsLike (unembed p)
+    }
+
+-- LR schedule: warmup + cosine decay
+lrWarmupCosine
+  :: Int  -- warmup steps
+  -> Int  -- total steps
+  -> R    -- peak lr
+  -> R    -- min lr
+  -> Int  -- step (1-based)
+  -> R
+lrWarmupCosine warmup total base minLR step
+  | total <= 1 = base
+  | step <= 0  = 0
+  | step <= warmup =
+      base * (fromIntegral step / fromIntegral (max 1 warmup))
+  | otherwise =
+      let !t  = fromIntegral (min step total)
+          !w  = fromIntegral warmup
+          !tt = fromIntegral total
+          !progress = (t - w) / max 1 (tt - w)
+          !cosine   = 0.5 * (1 + cos (pi * progress))
+      in minLR + (base - minLR) * cosine
+
+-- AdamW update helpers (elementwise ops via (*) and (/))
+adamUpdateMat :: R -> AdamConfig -> R -> R -> Mat -> MatMoments -> Mat -> (Mat, MatMoments)
+adamUpdateMat lr AdamConfig{..} b1Pow' b2Pow' w (MatMoments m v) g =
+  let !m'   = LA.scale adamB1 m + LA.scale (1 - adamB1) g
+      !g2   = g * g
+      !v'   = LA.scale adamB2 v + LA.scale (1 - adamB2) g2
+      !mHat = LA.scale (1 / (1 - b1Pow')) m'
+      !vHat = LA.scale (1 / (1 - b2Pow')) v'
+      !den  = LA.cmap (+ adamEps) (LA.cmap sqrt vHat)
+      !step = mHat / den
+      -- decoupled weight decay:
+      !w'   = w - LA.scale lr step - LA.scale (lr * adamWD) w
+  in (w', MatMoments m' v')
+
+adamUpdateVecNoWD :: R -> AdamConfig -> R -> R -> Vec -> VecMoments -> Vec -> (Vec, VecMoments)
+adamUpdateVecNoWD lr AdamConfig{..} b1Pow' b2Pow' w (VecMoments m v) g =
+  let !m'   = LA.scale adamB1 m + LA.scale (1 - adamB1) g
+      !g2   = g * g
+      !v'   = LA.scale adamB2 v + LA.scale (1 - adamB2) g2
+      !mHat = LA.scale (1 / (1 - b1Pow')) m'
+      !vHat = LA.scale (1 / (1 - b2Pow')) v'
+      !den  = LA.cmap (+ adamEps) (LA.cmap sqrt vHat)
+      !step = mHat / den
+      !w'   = w - LA.scale lr step
+  in (w', VecMoments m' v')
+
+adamUpdateLinear :: R -> AdamConfig -> R -> R -> LinearParams -> LinearMoments -> LinearParams -> (LinearParams, LinearMoments)
+adamUpdateLinear lr cfg b1Pow' b2Pow' p (LinearMoments wm bm) g =
+  let (w', wm') = adamUpdateMat lr cfg b1Pow' b2Pow' (linW p) wm (linW g)
+      -- No WD on bias
+      (b', bm') = adamUpdateVecNoWD lr cfg b1Pow' b2Pow' (linB p) bm (linB g)
+  in (LinearParams w' b', LinearMoments wm' bm')
+
+adamStep
+  :: R                -- current lr
+  -> AdamConfig
+  -> TransformerParams
+  -> Mat -> Mat        -- gTok, gPos
+  -> ExampleGrads
+  -> AdamState
+  -> (TransformerParams, AdamState)
+adamStep lr cfg p gTok gPos eg st =
+  let !t'     = asTimestep st + 1
+      !b1Pow' = asB1Pow st * adamB1 cfg
+      !b2Pow' = asB2Pow st * adamB2 cfg
+
+      (tok', tokMom') = adamUpdateMat lr cfg b1Pow' b2Pow' (tokEmbed p) (asTokMom st) gTok
+      (pos', posMom') = adamUpdateMat lr cfg b1Pow' b2Pow' (posEmbed p) (asPosMom st) gPos
+
+      AttentionParams wq wk wv wo = attnParams p
+      (wq', wqMom') = adamUpdateLinear lr cfg b1Pow' b2Pow' wq (asWqMom st) (egAttnWq eg)
+      (wk', wkMom') = adamUpdateLinear lr cfg b1Pow' b2Pow' wk (asWkMom st) (egAttnWk eg)
+      (wv', wvMom') = adamUpdateLinear lr cfg b1Pow' b2Pow' wv (asWvMom st) (egAttnWv eg)
+      (wo', woMom') = adamUpdateLinear lr cfg b1Pow' b2Pow' wo (asWoMom st) (egAttnWo eg)
+
+      -- LN params: no WD
+      (ln1g', ln1gMom') = adamUpdateVecNoWD lr cfg b1Pow' b2Pow' (lnGamma (ln1 p)) (asLn1GMom st) (egLn1Gamma eg)
+      (ln1b', ln1bMom') = adamUpdateVecNoWD lr cfg b1Pow' b2Pow' (lnBeta  (ln1 p)) (asLn1BMom st) (egLn1Beta  eg)
+
+      FFNParams ff1 ff2 = ffnParams p
+      (ff1', ff1Mom') = adamUpdateLinear lr cfg b1Pow' b2Pow' ff1 (asFF1Mom st) (egFFN1 eg)
+      (ff2', ff2Mom') = adamUpdateLinear lr cfg b1Pow' b2Pow' ff2 (asFF2Mom st) (egFFN2 eg)
+
+      (ln2g', ln2gMom') = adamUpdateVecNoWD lr cfg b1Pow' b2Pow' (lnGamma (ln2 p)) (asLn2GMom st) (egLn2Gamma eg)
+      (ln2b', ln2bMom') = adamUpdateVecNoWD lr cfg b1Pow' b2Pow' (lnBeta  (ln2 p)) (asLn2BMom st) (egLn2Beta  eg)
+
+      (un', unMom') = adamUpdateLinear lr cfg b1Pow' b2Pow' (unembed p) (asUnMom st) (egUnembed eg)
+
+      p' = TransformerParams
+        { tokEmbed   = tok'
+        , posEmbed   = pos'
+        , attnParams = AttentionParams wq' wk' wv' wo'
+        , ln1        = LayerNormParams ln1g' ln1b'
+        , ffnParams  = FFNParams ff1' ff2'
+        , ln2        = LayerNormParams ln2g' ln2b'
+        , unembed    = un'
+        }
+
+      st' = st
+        { asTimestep = t'
+        , asB1Pow    = b1Pow'
+        , asB2Pow    = b2Pow'
+        , asTokMom   = tokMom'
+        , asPosMom   = posMom'
+        , asWqMom    = wqMom'
+        , asWkMom    = wkMom'
+        , asWvMom    = wvMom'
+        , asWoMom    = woMom'
+        , asLn1GMom  = ln1gMom'
+        , asLn1BMom  = ln1bMom'
+        , asFF1Mom   = ff1Mom'
+        , asFF2Mom   = ff2Mom'
+        , asLn2GMom  = ln2gMom'
+        , asLn2BMom  = ln2bMom'
+        , asUnMom    = unMom'
+        }
+  in (p', st')
 
 --------------------------------------------------------------------------------
--- Init (Xavier) using hmatrix uniformSample
+-- Xavier init (no LA.uniformSample dependency)
 --------------------------------------------------------------------------------
+
+randomListN :: Int -> (R, R) -> StdGen -> ([R], StdGen)
+randomListN n range0 g0 = go n g0 []
+  where
+    go 0 !g acc = (reverse acc, g)
+    go k !g acc =
+      let (x, g') = randomR range0 g
+      in go (k - 1) g' (x : acc)
 
 xavierInit :: Int -> Int -> Int -> (Mat, Int)
-xavierInit r c seed =
+xavierInit r c seed0 =
   let bound = sqrt (6 / fromIntegral (r + c))
-      m     = LA.uniformSample seed r (replicate c (-bound, bound))
-  in (m, seed + 1)
+      g0 = mkStdGen seed0
+      (vals, g1) = randomListN (r * c) (-bound, bound) g0
+      (seed1, _) = (random g1 :: (Int, StdGen))
+  in ((r LA.>< c) vals, seed1)
 
 initLinear :: Int -> Int -> Int -> (LinearParams, Int)
 initLinear outDim inDim seed0 =
@@ -672,17 +786,13 @@ initTransformer :: Int -> Int -> Int -> Int -> Int -> (TransformerParams, Int)
 initTransformer vocab dModel dFF dK seed0 =
   let (tokE,  s1) = xavierInit vocab dModel seed0
       (posE,  s2) = xavierInit 2     dModel s1
-
-      (wq,    s3) = initLinear dK    dModel s2
-      (wk,    s4) = initLinear dK    dModel s3
-      (wv,    s5) = initLinear dK    dModel s4
-      (wo,    s6) = initLinear dModel dK   s5
-
-      (ff1,   s7) = initLinear dFF   dModel s6
-      (ff2,   s8) = initLinear dModel dFF  s7
-
-      (unemb, s9) = initLinear vocab dModel s8
-
+      (wq,    s3) = initLinear dK     dModel s2
+      (wk,    s4) = initLinear dK     dModel s3
+      (wv,    s5) = initLinear dK     dModel s4
+      (wo,    s6) = initLinear dModel dK     s5
+      (ff1,   s7) = initLinear dFF    dModel s6
+      (ff2,   s8) = initLinear dModel dFF    s7
+      (unemb, s9) = initLinear vocab  dModel s8
       params = TransformerParams
         { tokEmbed   = tokE
         , posEmbed   = posE
@@ -695,162 +805,39 @@ initTransformer vocab dModel dFF dK seed0 =
   in (params, s9)
 
 --------------------------------------------------------------------------------
--- Checkpoint save / load
---
--- Format: a single text file with all parameters serialized as flat doubles.
--- Header line: "CHECKPOINT <epoch> <seed> <vocab> <dModel> <dFF> <dK>"
--- Remaining lines: one double per line.
---
--- The order of serialization must match exactly between save and load.
+-- ST embedding accumulation (column-major buffer to match (><) / flatten
 --------------------------------------------------------------------------------
 
--- | Flatten a matrix row-major into a list of doubles.
-matToList :: Mat -> [R]
-matToList m = LA.toList (LA.flatten m)
-
--- | Rebuild a matrix from a flat list given (rows, cols).
-listToMat :: Int -> Int -> [R] -> Mat
-listToMat r c xs = (r LA.>< c) xs
-
--- | Flatten a vector into a list of doubles.
-vecToList :: Vec -> [R]
-vecToList = LA.toList
-
--- | Rebuild a vector from a list of doubles.
-listToVec :: [R] -> Vec
-listToVec = LA.fromList
-
--- | Take n elements from a list, returning (taken, rest).
-takeN :: Int -> [R] -> ([R], [R])
-takeN n xs = splitAt n xs
-
--- | Serialize LinearParams to a list of doubles.
-serializeLinear :: LinearParams -> [R]
-serializeLinear LinearParams{..} = matToList linW ++ vecToList linB
-
--- | Deserialize LinearParams given (outDim, inDim).
-deserializeLinear :: Int -> Int -> [R] -> (LinearParams, [R])
-deserializeLinear outDim inDim xs =
-  let (wData, xs1) = takeN (outDim * inDim) xs
-      (bData, xs2) = takeN outDim xs1
-  in (LinearParams (listToMat outDim inDim wData) (listToVec bData), xs2)
-
--- | Serialize LayerNormParams.
-serializeLN :: LayerNormParams -> [R]
-serializeLN LayerNormParams{..} = vecToList lnGamma ++ vecToList lnBeta
-
--- | Deserialize LayerNormParams given dim.
-deserializeLN :: Int -> [R] -> (LayerNormParams, [R])
-deserializeLN d xs =
-  let (gData, xs1) = takeN d xs
-      (bData, xs2) = takeN d xs1
-  in (LayerNormParams (listToVec gData) (listToVec bData), xs2)
-
--- | Serialize all TransformerParams to a flat list.
-serializeParams :: TransformerParams -> [R]
-serializeParams TransformerParams{..} = concat
-  [ matToList tokEmbed
-  , matToList posEmbed
-  , serializeLinear (attnWq attnParams)
-  , serializeLinear (attnWk attnParams)
-  , serializeLinear (attnWv attnParams)
-  , serializeLinear (attnWo attnParams)
-  , serializeLN ln1
-  , serializeLinear (ffnLinear1 ffnParams)
-  , serializeLinear (ffnLinear2 ffnParams)
-  , serializeLN ln2
-  , serializeLinear unembed
-  ]
-
--- | Deserialize TransformerParams from a flat list.
-deserializeParams :: Int -> Int -> Int -> Int -> [R] -> TransformerParams
-deserializeParams vocab dModel dFF dK xs0 =
-  let (tokData, xs1)  = takeN (vocab * dModel) xs0
-      (posData, xs2)  = takeN (2 * dModel)     xs1
-      (wq,      xs3)  = deserializeLinear dK     dModel xs2
-      (wk,      xs4)  = deserializeLinear dK     dModel xs3
-      (wv,      xs5)  = deserializeLinear dK     dModel xs4
-      (wo,      xs6)  = deserializeLinear dModel  dK    xs5
-      (ln1p,    xs7)  = deserializeLN dModel xs6
-      (ff1,     xs8)  = deserializeLinear dFF    dModel xs7
-      (ff2,     xs9)  = deserializeLinear dModel  dFF   xs8
-      (ln2p,    xs10) = deserializeLN dModel xs9
-      (unemb,   _)    = deserializeLinear vocab  dModel xs10
-  in TransformerParams
-      { tokEmbed   = listToMat vocab dModel tokData
-      , posEmbed   = listToMat 2 dModel posData
-      , attnParams = AttentionParams wq wk wv wo
-      , ln1        = ln1p
-      , ffnParams  = FFNParams ff1 ff2
-      , ln2        = ln2p
-      , unembed    = unemb
-      }
-
--- | Save a checkpoint to a file.
--- Stores epoch, RNG seed, architecture dims, and all weights.
-saveCheckpoint :: FilePath -> TransformerParams -> Int -> Int -> Int -> Int -> Int -> Int -> IO ()
-saveCheckpoint path params epoch seed vocab dModel dFF dK = do
-  let header = unwords
-        [ "CHECKPOINT", show epoch, show seed
-        , show vocab, show dModel, show dFF, show dK
-        ]
-      doubles = serializeParams params
-      contents = unlines (header : map show doubles)
-  writeFile path contents
-  printf "  [checkpoint] Saved epoch %d to %s (%d parameters)\n" epoch path (length doubles)
-
--- | Load a checkpoint from a file.
--- Returns (params, epoch, seed) or Nothing if the file doesn't exist.
-loadCheckpoint :: FilePath -> IO (Maybe (TransformerParams, Int, Int))
-loadCheckpoint path = do
-  exists <- doesFileExist path
-  if not exists
-    then return Nothing
-    else do
-      contents <- readFile path
-      length contents `seq` return ()  -- force full read to release handle
-      let ls = lines contents
-      case ls of
-        [] -> return Nothing
-        (headerLine : rest) ->
-          case words headerLine of
-            ["CHECKPOINT", epochS, seedS, vocabS, dModelS, dFFS, dKS] ->
-              let epoch  = read epochS  :: Int
-                  seed   = read seedS   :: Int
-                  vocab  = read vocabS  :: Int
-                  dModel = read dModelS :: Int
-                  dFF    = read dFFS    :: Int
-                  dK     = read dKS     :: Int
-                  doubles = map read rest :: [R]
-                  params = deserializeParams vocab dModel dFF dK doubles
-              in return $ Just (params, epoch, seed)
-            _ -> do
-              putStrLn "  [checkpoint] Warning: invalid checkpoint header, ignoring."
-              return Nothing
+-- Column-major index: ix = row + col*rows
+addRowCM :: VSM.MVector s R -> Int -> Int -> Vec -> ST s ()
+addRowCM buf !rows !row !v = do
+  let !cols = vlen v
+  forM_ [0 .. cols - 1] $ \j -> do
+    let !ix = row + j * rows
+    old <- VSM.unsafeRead buf ix
+    let !new = old + (v `LA.atIndex` j)
+    VSM.unsafeWrite buf ix new
 
 --------------------------------------------------------------------------------
--- Data + shuffle (proper Fisher–Yates)
+-- Data & evaluation
 --------------------------------------------------------------------------------
 
-type Example = (Int, Int, Int)  -- (a, b, (a+b) mod p)
+type Example = (Int, Int, Int)
 
 generateData :: Int -> [Example]
 generateData p = [ (a, b, (a + b) `mod` p) | a <- [0 .. p - 1], b <- [0 .. p - 1] ]
 
--- Proper Fisher–Yates shuffle on a vector, returns a new seed.
 shuffle :: Int -> [a] -> ([a], Int)
 shuffle seed xs = runST $ do
   let v0 = V.fromList xs
       n  = V.length v0
   mv <- V.thaw v0
   gRef <- newSTRef (mkStdGen seed)
-
   forM_ [n-1, n-2 .. 1] $ \i -> do
     g <- readSTRef gRef
     let (j, g') = randomR (0, i) g
     writeSTRef gRef g'
     MV.swap mv i j
-
   v1 <- V.freeze mv
   gFinal <- readSTRef gRef
   let (seed', _) = (random gFinal :: (Int, StdGen))
@@ -863,37 +850,290 @@ splitData frac seed xs =
       nTrain = round (frac * fromIntegral n)
   in (take nTrain shuf, drop nTrain shuf, seed1)
 
---------------------------------------------------------------------------------
--- Train / eval
---------------------------------------------------------------------------------
-
-predict :: TransformerParams -> Int -> Int -> Int
-predict params a b =
-  let probs = forwardInfer params a b
-  in LA.maxIndex probs
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
 evaluate :: TransformerParams -> [Example] -> Double
 evaluate params examples =
-  let correct = length $ filter (\(a,b,t) -> predict params a b == t) examples
+  let correct = length $ filter (\(a,b,t) -> LA.maxIndex (forwardInfer params a b) == t) examples
   in fromIntegral correct / fromIntegral (length examples)
 
-trainStep :: TransformerParams -> R -> R -> Example -> (TransformerParams, R)
-trainStep !params lr wd (a, b, target) =
-  let (!probs, !cache) = forwardTrain params a b
-      !loss  = crossEntropyLoss probs target
-      !grads = backward params cache a b target
-      !params' = applyGradients lr wd params grads
-  in (params', loss)
+--------------------------------------------------------------------------------
+-- Training (batched)
+--------------------------------------------------------------------------------
 
-trainEpoch :: TransformerParams -> R -> R -> [Example] -> Int -> (TransformerParams, R, Int)
-trainEpoch params lr wd examples seed =
+trainBatch
+  :: TransformerParams
+  -> AdamState
+  -> AdamConfig
+  -> (Int -> R)             -- lr(step)
+  -> Int -> Int -> Int -> Int -- vocab dModel dFF dK
+  -> [Example]
+  -> (TransformerParams, AdamState, R)
+trainBatch params st0 cfg lrOfStep vocab dModel dFF dK batch =
+  let (!gTok, !gPos, !egSum, !lossSum) = runST $ do
+        tokBuf <- VSM.replicate (vocab * dModel) 0
+        posBuf <- VSM.replicate (2 * dModel) 0
+        gRef   <- newSTRef (zeroExampleGrads vocab dModel dFF dK)
+        lRef   <- newSTRef 0
+
+        forM_ batch $ \(a,b,tgt) -> do
+          let (probs, cache) = forwardTrain params a b
+              !l = crossEntropyLoss probs tgt
+              eg = backward params cache a b tgt
+
+          addRowCM tokBuf vocab a (egDX0 eg)
+          addRowCM tokBuf vocab b (egDX1 eg)
+          addRowCM posBuf 2     0 (egDX0 eg)
+          addRowCM posBuf 2     1 (egDX1 eg)
+
+          modifySTRef' gRef (`addExampleGrads` eg)
+          modifySTRef' lRef (+ l)
+
+        tokV <- VS.unsafeFreeze tokBuf
+        posV <- VS.unsafeFreeze posBuf
+        egAcc <- readSTRef gRef
+        lAcc  <- readSTRef lRef
+
+        let !gTokM = (vocab LA.>< dModel) (VS.toList tokV)
+            !gPosM = (2     LA.>< dModel) (VS.toList posV)
+        pure (gTokM, gPosM, egAcc, lAcc)
+
+      !bs = max 1 (length batch)
+      !invBS = 1 / fromIntegral bs
+      !gTokAvg = LA.scale invBS gTok
+      !gPosAvg = LA.scale invBS gPos
+      !egAvg   = scaleExampleGrads invBS egSum
+
+      !stepNow = asTimestep st0 + 1
+      !lrNow   = lrOfStep stepNow
+
+      (params', st') = adamStep lrNow cfg params gTokAvg gPosAvg egAvg st0
+  in (params', st', lossSum)
+
+trainEpoch
+  :: TransformerParams
+  -> AdamState
+  -> AdamConfig
+  -> (Int -> R)
+  -> Int -> Int -> Int -> Int
+  -> Int
+  -> [Example]
+  -> Int
+  -> (TransformerParams, AdamState, R, Int)
+trainEpoch params st cfg lrSched vocab dModel dFF dK batchSize examples seed =
   let (shuf, seed1) = shuffle seed examples
-      (!params', !lossSum) = foldl' step (params, 0) shuf
-      step (!p, !acc) ex =
-        let (!p', !l) = trainStep p lr wd ex
-        in (p', acc + l)
-      avgLoss = lossSum / fromIntegral (length examples)
-  in (params', avgLoss, seed1)
+      batches = chunksOf batchSize shuf
+
+      step (!p, !as, !lossAcc) batch =
+        let (p', as', l) = trainBatch p as cfg lrSched vocab dModel dFF dK batch
+        in (p', as', lossAcc + l)
+
+      (!finalP, !finalS, !totalLoss) = foldl' step (params, st, 0) batches
+      avgLoss = totalLoss / fromIntegral (length examples)
+  in (finalP, finalS, avgLoss, seed1)
+
+--------------------------------------------------------------------------------
+-- Text checkpoint: params + adam moments + timestep
+--------------------------------------------------------------------------------
+
+matToList :: Mat -> [R]
+matToList m = LA.toList (LA.flatten m)
+
+listToMat :: Int -> Int -> [R] -> Mat
+listToMat r c xs = (r LA.>< c) xs
+
+vecToList :: Vec -> [R]
+vecToList = LA.toList
+
+listToVec :: [R] -> Vec
+listToVec = LA.fromList
+
+takeN :: Int -> [R] -> ([R], [R])
+takeN n xs = splitAt n xs
+
+serializeLinear :: LinearParams -> [R]
+serializeLinear LinearParams{..} = matToList linW ++ vecToList linB
+
+deserializeLinear :: Int -> Int -> [R] -> (LinearParams, [R])
+deserializeLinear outDim inDim xs =
+  let (wData, xs1) = takeN (outDim * inDim) xs
+      (bData, xs2) = takeN outDim xs1
+  in (LinearParams (listToMat outDim inDim wData) (listToVec bData), xs2)
+
+serializeLN :: LayerNormParams -> [R]
+serializeLN LayerNormParams{..} = vecToList lnGamma ++ vecToList lnBeta
+
+deserializeLN :: Int -> [R] -> (LayerNormParams, [R])
+deserializeLN d xs =
+  let (gData, xs1) = takeN d xs
+      (bData, xs2) = takeN d xs1
+  in (LayerNormParams (listToVec gData) (listToVec bData), xs2)
+
+serializeParams :: TransformerParams -> [R]
+serializeParams TransformerParams{..} = concat
+  [ matToList tokEmbed, matToList posEmbed
+  , serializeLinear (attnWq attnParams), serializeLinear (attnWk attnParams)
+  , serializeLinear (attnWv attnParams), serializeLinear (attnWo attnParams)
+  , serializeLN ln1
+  , serializeLinear (ffnLinear1 ffnParams), serializeLinear (ffnLinear2 ffnParams)
+  , serializeLN ln2
+  , serializeLinear unembed
+  ]
+
+deserializeParams :: Int -> Int -> Int -> Int -> [R] -> (TransformerParams, [R])
+deserializeParams vocab dModel dFF dK xs0 =
+  let (tokData, xs1)  = takeN (vocab * dModel) xs0
+      (posData, xs2)  = takeN (2 * dModel)     xs1
+      (wq,      xs3)  = deserializeLinear dK     dModel xs2
+      (wk,      xs4)  = deserializeLinear dK     dModel xs3
+      (wv,      xs5)  = deserializeLinear dK     dModel xs4
+      (wo,      xs6)  = deserializeLinear dModel  dK    xs5
+      (ln1p,    xs7)  = deserializeLN dModel xs6
+      (ff1,     xs8)  = deserializeLinear dFF    dModel xs7
+      (ff2,     xs9)  = deserializeLinear dModel  dFF   xs8
+      (ln2p,    xs10) = deserializeLN dModel xs9
+      (unemb,   xs11) = deserializeLinear vocab  dModel xs10
+      p = TransformerParams
+          { tokEmbed   = listToMat vocab dModel tokData
+          , posEmbed   = listToMat 2 dModel posData
+          , attnParams = AttentionParams wq wk wv wo
+          , ln1        = ln1p
+          , ffnParams  = FFNParams ff1 ff2
+          , ln2        = ln2p
+          , unembed    = unemb
+          }
+  in (p, xs11)
+
+serializeMatMom :: MatMoments -> [R]
+serializeMatMom (MatMoments m v) = matToList m ++ matToList v
+
+deserializeMatMom :: Int -> Int -> [R] -> (MatMoments, [R])
+deserializeMatMom r c xs =
+  let (mData, xs1) = takeN (r*c) xs
+      (vData, xs2) = takeN (r*c) xs1
+  in (MatMoments (listToMat r c mData) (listToMat r c vData), xs2)
+
+serializeVecMom :: VecMoments -> [R]
+serializeVecMom (VecMoments m v) = vecToList m ++ vecToList v
+
+deserializeVecMom :: Int -> [R] -> (VecMoments, [R])
+deserializeVecMom n xs =
+  let (mData, xs1) = takeN n xs
+      (vData, xs2) = takeN n xs1
+  in (VecMoments (listToVec mData) (listToVec vData), xs2)
+
+serializeLinearMom :: LinearMoments -> [R]
+serializeLinearMom (LinearMoments wm bm) = serializeMatMom wm ++ serializeVecMom bm
+
+deserializeLinearMom :: Int -> Int -> [R] -> (LinearMoments, [R])
+deserializeLinearMom outDim inDim xs =
+  let (wm, xs1) = deserializeMatMom outDim inDim xs
+      (bm, xs2) = deserializeVecMom outDim xs1
+  in (LinearMoments wm bm, xs2)
+
+serializeAdam :: AdamState -> [R]
+serializeAdam AdamState{..} =
+  concat
+    [ serializeMatMom asTokMom
+    , serializeMatMom asPosMom
+    , serializeLinearMom asWqMom
+    , serializeLinearMom asWkMom
+    , serializeLinearMom asWvMom
+    , serializeLinearMom asWoMom
+    , serializeVecMom asLn1GMom
+    , serializeVecMom asLn1BMom
+    , serializeLinearMom asFF1Mom
+    , serializeLinearMom asFF2Mom
+    , serializeVecMom asLn2GMom
+    , serializeVecMom asLn2BMom
+    , serializeLinearMom asUnMom
+    ]
+
+deserializeAdam
+  :: Int -> Int -> Int -> Int
+  -> [R]
+  -> (AdamState, [R])
+deserializeAdam vocab dModel dFF dK xs0 =
+  let (tokMom, xs1) = deserializeMatMom vocab dModel xs0
+      (posMom, xs2) = deserializeMatMom 2 dModel xs1
+      (wqMom,  xs3) = deserializeLinearMom dK dModel xs2
+      (wkMom,  xs4) = deserializeLinearMom dK dModel xs3
+      (wvMom,  xs5) = deserializeLinearMom dK dModel xs4
+      (woMom,  xs6) = deserializeLinearMom dModel dK xs5
+      (ln1GM,  xs7) = deserializeVecMom dModel xs6
+      (ln1BM,  xs8) = deserializeVecMom dModel xs7
+      (ff1M,   xs9) = deserializeLinearMom dFF dModel xs8
+      (ff2M,   xs10)= deserializeLinearMom dModel dFF xs9
+      (ln2GM,  xs11)= deserializeVecMom dModel xs10
+      (ln2BM,  xs12)= deserializeVecMom dModel xs11
+      (unM,    xs13)= deserializeLinearMom vocab dModel xs12
+      dummy = AdamState
+        { asTimestep = 0, asB1Pow = 1, asB2Pow = 1
+        , asTokMom = tokMom, asPosMom = posMom
+        , asWqMom = wqMom, asWkMom = wkMom, asWvMom = wvMom, asWoMom = woMom
+        , asLn1GMom = ln1GM, asLn1BMom = ln1BM
+        , asFF1Mom = ff1M, asFF2Mom = ff2M
+        , asLn2GMom = ln2GM, asLn2BMom = ln2BM
+        , asUnMom = unM
+        }
+  in (dummy, xs13)
+
+saveCheckpoint :: FilePath -> TransformerParams -> AdamState -> Int -> Int -> Int -> Int -> Int -> Int -> IO ()
+saveCheckpoint path params st epoch seed vocab dModel dFF dK = do
+  let header = unwords
+        [ "CHECKPOINT_ADAMW"
+        , show epoch, show seed
+        , show (asTimestep st)
+        , show (asB1Pow st), show (asB2Pow st)
+        , show vocab, show dModel, show dFF, show dK
+        ]
+      doubles = serializeParams params ++ serializeAdam st
+      contents = unlines (header : map show doubles)
+  writeFile path contents
+  printf "  [checkpoint] Saved epoch %d (step=%d) to %s\n" epoch (asTimestep st) path
+
+loadCheckpoint :: FilePath -> IO (Maybe (TransformerParams, AdamState, Int, Int))
+loadCheckpoint path = do
+  exists <- doesFileExist path
+  if not exists then pure Nothing else do
+    contents <- readFile path
+    length contents `seq` pure ()
+    case lines contents of
+      (header:rest) ->
+        case words header of
+          ("CHECKPOINT_ADAMW":e:s:ts:b1p:b2p:v:dm:df:dk:_) -> do
+            let epoch  = read e
+                seed   = read s
+                tstep  = read ts
+                b1pow  = read b1p
+                b2pow  = read b2p
+                vocab  = read v
+                dModel = read dm
+                dFF    = read df
+                dK     = read dk
+                nums   = map read rest
+                (params, xs1) = deserializeParams vocab dModel dFF dK nums
+                (adam0, _xs2) = deserializeAdam vocab dModel dFF dK xs1
+                adam = adam0 { asTimestep = tstep, asB1Pow = b1pow, asB2Pow = b2pow }
+            pure (Just (params, adam, epoch, seed))
+
+          -- Back-compat: old params-only checkpoints
+          ("CHECKPOINT":e:s:v:dm:df:dk:_) -> do
+            let epoch  = read e
+                seed   = read s
+                vocab  = read v
+                dModel = read dm
+                dFF    = read df
+                dK     = read dk
+                nums   = map read rest
+                (params, _rest2) = deserializeParams vocab dModel dFF dK nums
+                adam = initAdamState params
+            pure (Just (params, adam, epoch, seed))
+
+          _ -> pure Nothing
+      _ -> pure Nothing
 
 --------------------------------------------------------------------------------
 -- Main
@@ -902,80 +1142,70 @@ trainEpoch params lr wd examples seed =
 main :: IO ()
 main = do
   putStrLn "╔══════════════════════════════════════════════════════════════╗"
-  putStrLn "║  Modular Arithmetic Transformer — Haskell + hmatrix          ║"
-  putStrLn "║  Task: Learn (a + b) mod p                                   ║"
+  putStrLn "║  Modular Transformer (AdamW + Warmup/Cosine + ST Embedding)  ║"
   putStrLn "╚══════════════════════════════════════════════════════════════╝"
-  putStrLn ""
 
-  -- Hyperparameters
   let p         = 53
       dModel    = 64
-      dFF       = 128
-      dK        = 32
-      lr        = 0.005
-      wd        = 0.05
-      epochs    = 20000000
-      trainFrac = 0.3
+      dFF       = 256
+      dK        = 64
+      batchSize = 32
+
+      baseLR    = 1e-3
+      minLR     = 1e-5
+      wd        = 1e-2
+
+      epochs    = 20000
+      trainFrac = 0.5
       seed0     = 42
       ckptPath  = "checkpoint.ckpt"
-      ckptEvery = 1000  -- save every N epochs
 
-  printf "Modulus p = %d\n" p
-  printf "Model dim = %d, FFN dim = %d, Key dim = %d\n" dModel dFF dK
-  printf "Learning rate = %.4f, Weight decay = %.4f\n" lr wd
-  printf "Train fraction = %.0f%%\n\n" (trainFrac * 100 :: Double)
+      cfg = AdamConfig
+        { adamB1  = 0.9
+        , adamB2  = 0.999
+        , adamEps = 1e-8
+        , adamWD  = wd
+        }
 
   let allData = generateData p
-  printf "Total examples: %d (= %d × %d)\n" (length allData) p p
-
   let (trainData, testData, seed1) = splitData trainFrac seed0 allData
-  printf "Training: %d examples, Test: %d examples\n\n" (length trainData) (length testData)
 
-  -- Try to load an existing checkpoint
+  let batchesPerEpoch = max 1 ((length trainData + batchSize - 1) `div` batchSize)
+      totalSteps      = epochs * batchesPerEpoch
+      warmupSteps     = min 2000 (max 100 (totalSteps `div` 20))
+      lrSched step    = lrWarmupCosine warmupSteps totalSteps baseLR minLR step
+
   mCkpt <- loadCheckpoint ckptPath
-  let (initParams, startEpoch, seed2) = case mCkpt of
-        Just (ckptParams, ckptEpoch, ckptSeed) ->
-          (ckptParams, ckptEpoch + 1, ckptSeed)
-        Nothing ->
-          let (freshParams, s) = initTransformer p dModel dFF dK seed1
-          in (freshParams, 1, s)
+  let (initParams, initState, startEpoch, seed2) =
+        case mCkpt of
+          Just (cp, st, ce, cs) -> (cp, st, ce + 1, cs)
+          Nothing ->
+            let (fp, s) = initTransformer p dModel dFF dK seed1
+                st = initAdamState fp
+            in (fp, st, 1, s)
 
-  case mCkpt of
-    Just (_, ckptEpoch, _) ->
-      printf "Resumed from checkpoint at epoch %d.\n\n" ckptEpoch
-    Nothing ->
-      putStrLn "No checkpoint found. Starting fresh (Xavier init).\n"
+  printf "Params: p=%d dModel=%d dFF=%d dK=%d Batch=%d\n" p dModel dFF dK batchSize
+  printf "AdamW: baseLR=%.6f minLR=%.6f warmup=%d steps totalSteps=%d wd=%.4f\n"
+    baseLR minLR warmupSteps totalSteps wd
+  printf "Data: %d train, %d test\n\n" (length trainData) (length testData)
 
-  putStrLn "Epoch | Train Loss | Train Acc | Test Acc"
-  putStrLn "------+------------+-----------+---------"
-  hFlush stdout
-
-  let loop !epoch !params !seed
-        | epoch > epochs = do
-            putStrLn ""
-            putStrLn "Training complete!"
-            let finalTrainAcc = evaluate params trainData
-                finalTestAcc  = evaluate params testData
-            printf "Final — Train: %.1f%%, Test: %.1f%%\n"
-              (finalTrainAcc * 100) (finalTestAcc * 100)
-            -- Save final checkpoint (only if we actually trained)
-            when (epoch > startEpoch) $
-              saveCheckpoint ckptPath params (epoch - 1) seed p dModel dFF dK
-
+  let loop !epoch !params !st !seed
+        | epoch > epochs = putStrLn "Done."
         | otherwise = do
-            let (!params', !avgLoss, !seed') = trainEpoch params lr wd trainData seed
+            let (!params', !st', !loss, !seed') =
+                  trainEpoch params st cfg lrSched p dModel dFF dK batchSize trainData seed
 
-            when (epoch == startEpoch || epoch `mod` 10 == 0) $ do
-              let trainAcc = evaluate params' trainData
-                  testAcc  = evaluate params' testData
-              printf "%5d | %10.4f | %8.1f%% | %7.1f%%\n"
-                epoch avgLoss (trainAcc * 100) (testAcc * 100)
+            when (epoch `mod` 100 == 0) $ do
+              let trAcc = evaluate params' trainData
+                  teAcc = evaluate params' testData
+                  lrNow = lrSched (asTimestep st')
+              printf "%5d | step=%7d | lr=%.6f | loss=%.4f | train=%.1f%% | test=%.1f%%\n"
+                epoch (asTimestep st') lrNow loss (trAcc*100) (teAcc*100)
               hFlush stdout
 
-            -- Periodic checkpoint save
-            when (epoch `mod` ckptEvery == 0) $
-              saveCheckpoint ckptPath params' epoch seed' p dModel dFF dK
+            when (epoch `mod` 1000 == 0) $
+              saveCheckpoint ckptPath params' st' epoch seed' p dModel dFF dK
 
-            loop (epoch + 1) params' seed'
+            loop (epoch + 1) params' st' seed'
 
-  loop startEpoch initParams seed2
+  loop startEpoch initParams initState seed2

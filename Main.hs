@@ -1153,9 +1153,8 @@ main = do
 
       baseLR    = 1e-3
       minLR     = 1e-5
-      wd        = 1e-2
-
-      epochs    = 20000
+      wd        = 1e-3
+      epochs    = 500000
       trainFrac = 0.5
       seed0     = 42
       ckptPath  = "checkpoint.ckpt"

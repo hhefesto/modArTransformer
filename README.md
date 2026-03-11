@@ -26,3 +26,8 @@ npx vite
 ```
 
 Opens at http://localhost:5173 — click any block to explore what it does, parameter counts, tensor shapes, and the Haskell implementation.
+
+## References
+
+- Alethea Power, Yuri Burda, Harri Edwards, Igor Babuschkin, Vedant Misra. *Grokking: Generalization Beyond Overfitting on Small Algorithmic Datasets*. arXiv:2201.02177 (2022). https://arxiv.org/abs/2201.02177
+- Welch Labs. *The most complex model we actually understand*. https://www.youtube.com/watch?v=D8GOeCFFby4

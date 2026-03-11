@@ -15,7 +15,7 @@
         inputs.haskell-flake.flakeModule
       ];
 
-      perSystem = { self', pkgs, ... }: {
+      perSystem = { self', pkgs, config, ... }: {
         haskellProjects.default = {
           basePackages = pkgs.haskellPackages;
 
@@ -37,18 +37,38 @@
                 ghcid
                 haskell-language-server;
             };
-
-            mkShellArgs = {
-              packages = [
-                pkgs.blas
-                pkgs.lapack
-                pkgs.pkg-config
-              ];
-            };
           };
         };
 
         packages.default = self'.packages.modArTransformer;
+
+        apps.default = {
+          type = "app";
+          program = "${self'.packages.modArTransformer}/bin/modArTransformer";
+        };
+
+        apps.diagram = {
+          type = "app";
+          program = toString (pkgs.writeShellScript "run-diagram" ''
+            exec ${pkgs.nodejs}/bin/npx vite "$@"
+          '');
+        };
+
+        devShells.default = pkgs.lib.mkForce (pkgs.mkShell {
+          name = "modArTransformer-dev";
+          inputsFrom = [
+            config.haskellProjects.default.outputs.devShell
+          ];
+          nativeBuildInputs = with pkgs; [
+            blas
+            lapack
+            pkg-config
+            esbuild
+            python3
+            # nodejs_20
+            nodejs
+          ];
+        });
       };
     };
 }

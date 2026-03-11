@@ -14,6 +14,8 @@ cabal run modArTransformer
 
 Saves checkpoints to `checkpoint.ckpt`. Remove this file to start training from scratch.
 
+**Note:** Achieving 99% test accuracy required tuning the weight decay parameter (`wd = 1e-3` in `Main.hs`).
+
 ## Interactive Diagram
 
 ```bash

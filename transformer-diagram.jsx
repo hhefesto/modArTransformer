@@ -29,7 +29,7 @@ const C = {
 /* ───────────────────────── block data ───────────────────────────── */
 const BLOCKS = [
   {
-    id: "embed", label: "Token + Position Embedding", sub: "53×64 + 2×64 → [x₀, x₁]",
+    id: "embed", label: "Embedding", sub: "Token + Position → ℝ²ˣ⁶⁴",
     color: C.accent, bg: "#0d1a2a",
     what: `Each integer a, b ∈ [0..52] is looked up in a learned embedding table (53 rows × 64 cols) to produce a dense 64-dim vector. A separate positional embedding (2 rows × 64 cols) is added so the model knows which operand is which.
 
@@ -51,7 +51,7 @@ x1   = embB + (posEmbed LA.! 1)
 [x₀, x₁]  ∈  ℝ²ˣ⁶⁴  (2 tokens, 64-dim each)`,
   },
   {
-    id: "attn", label: "Single-Head Self-Attention", sub: "Wq, Wk, Wv, Wo each 64×64 — scores 2×2",
+    id: "attn", label: "Attention", sub: "Single-Head Self-Attention",
     color: C.purple, bg: C.purpleBg,
     what: `Every token is linearly projected into a Query, Key, and Value:
   Q = Wq·x + bq,   K = Wk·x + bk,   V = Wv·x + bv
@@ -60,7 +60,7 @@ Dot-product scores QKᵀ/√64 form a 2×2 attention matrix. After row-wise soft
   attended = softmax(QKᵀ/√dₖ) · V
   out = Wₒ · attended + bₒ
 
-No causal mask is used — both tokens see each other.`,
+Includes residual connection and LayerNorm (post-norm). No causal mask — both tokens see each other.`,
     why: `This is the only place the two operands exchange information. The 2×2 attention matrix controls how much of operand b's representation gets mixed into operand a's (and vice versa).
 
 With no causal mask both tokens see each other freely — this is appropriate because addition is commutative and both operands are needed equally.`,
@@ -68,8 +68,9 @@ With no causal mask both tokens see each other freely — this is appropriate be
 Wk  64×64 + bk 64  =  4,160
 Wv  64×64 + bv 64  =  4,160
 Wₒ  64×64 + bₒ 64  =  4,160
+LayerNorm γ,β      =    128
 ────────────────────────────
-Subtotal             16,640`,
+Subtotal             16,768`,
     hs: `qs = map (linearForward attnWq) xs
 ks = map (linearForward attnWk) xs
 vs = map (linearForward attnWv) xs
@@ -85,154 +86,121 @@ weights = [ softmax $ scale sf $
 -- weighted sum of values
 attended = [ Σⱼ wᵢⱼ · vⱼ | wᵢ <- weights ]
 
--- output projection
-outs = map (linearForward attnWo) attended`,
+-- output projection + residual + layernorm
+outs = map (linearForward attnWo) attended
+residual = zipWith (+) embedded outs
+ln1Out = map (layerNormForward ln1) residual`,
     shapes: `Q, K, V      ∈  ℝ²ˣ⁶⁴
 raw scores   ∈  ℝ²ˣ²   (before softmax)
 weights      ∈  ℝ²ˣ²   (after softmax, rows sum to 1)
 attended     ∈  ℝ²ˣ⁶⁴
-attnOut      ∈  ℝ²ˣ⁶⁴  (after Wₒ projection)`,
+attnOut      ∈  ℝ²ˣ⁶⁴  (after Wₒ, residual, LayerNorm)`,
   },
   {
-    id: "res1", label: "Residual #1 — Add", sub: "embedded + attnOut",
-    color: C.cyan, bg: C.cyanBg, small: true,
-    what: `Element-wise addition:
-  residual₁ᵢ = xᵢ + attnOutᵢ   for each token i`,
-    why: `The skip connection lets gradients flow directly back to the embeddings, preventing vanishing gradients. It also lets attention learn a "correction" (delta) to the input rather than re-encoding the full signal.`,
-    params: `0 learnable parameters — just element-wise addition.`,
-    hs: `residual1 = zipWith (+) embedded attnOut`,
-    shapes: `ℝ²ˣ⁶⁴ + ℝ²ˣ⁶⁴  →  ℝ²ˣ⁶⁴`,
-  },
-  {
-    id: "ln1", label: "LayerNorm #1", sub: "γ, β ∈ ℝ⁶⁴  (shared across tokens)",
-    color: C.green, bg: C.greenBg,
-    what: `Per token: subtract mean, divide by std-dev, then apply a learned affine transform:
-  μ = mean(x)
-  x̂ = (x − μ) / √(σ² + ε)
-  out = γ · x̂ + β
-
-This is post-norm placement (normalisation happens after the residual, not before attention). ε = 1e-5 for numerical stability.`,
-    why: `Keeps activations on a stable scale so the downstream FFN receives well-conditioned inputs. Without it, magnitudes can drift during training and make optimisation fragile.
-
-The learned γ and β let the model recover any scale or shift it needs — LN doesn't permanently constrain the representation.`,
-    params: `γ (gamma)   64 params
-β (beta)    64 params
-──────────────────────
-Subtotal       128     (shared across both tokens)`,
-    hs: `layerNormForward LayerNormParams{..} x =
-  let mu   = sumElements x / d
-      diff = x - konst mu n
-      var  = sumElements (diff * diff) / d
-      invS = 1 / sqrt (var + 1e-5)
-      xHat = scale invS diff
-      out  = lnGamma * xHat + lnBeta
-  in  (out, cache)`,
-    shapes: `Per token:  ℝ⁶⁴ → ℝ⁶⁴  (normalised, same shape)`,
-  },
-  {
-    id: "ffn", label: "Feed-Forward Network (MLP)", sub: "64 → 256 → ReLU → 64   per token",
+    id: "mlp", label: "MLP", sub: "64 → 256 → ReLU → 64",
     color: C.orange, bg: C.orangeBg,
     what: `Two linear layers with ReLU between them, applied independently to each token:
   hidden = ReLU(W₁ · x + b₁)      64 → 256  (expand)
   out    = W₂ · hidden + b₂       256 → 64   (compress)
 
-The 4× expansion ratio (64 → 256) is standard. ReLU zeroes negative activations, providing the essential nonlinearity.`,
-    why: `Attention mixes information across tokens; the FFN transforms each token's blended representation through a nonlinear bottleneck. The expansion to 256 dims gives the network enough parameters and capacity to learn the complex modular-arithmetic mapping.
+The 4× expansion ratio (64 → 256) is standard. ReLU zeroes negative activations, providing the essential nonlinearity.
+
+Includes residual connection and LayerNorm (post-norm).`,
+    why: `Attention mixes information across tokens; the MLP transforms each token's blended representation through a nonlinear bottleneck. The expansion to 256 dims gives the network enough parameters and capacity to learn the complex modular-arithmetic mapping.
 
 This is where most of the model's parameters live (33K of ~57K total). The "grokking" phenomenon likely involves these weights slowly finding Fourier-like representations of mod-53 arithmetic.`,
     params: `W₁  256×64 + b₁ 256  =  16,640
 W₂   64×256 + b₂  64  =  16,448
+LayerNorm γ,β        =     128
 ──────────────────────────────
-Subtotal                33,088`,
+Subtotal                33,216`,
     hs: `ffnForward FFNParams{..} x =
   let h   = linearForward ffnLinear1 x   -- 64 → 256
       act = relu h                        -- max(0, ·)
       out = linearForward ffnLinear2 act  -- 256 → 64
-  in  (out, FFNCache h act)`,
+  in  (out, FFNCache h act)
+
+-- with residual + layernorm
+residual2 = zipWith (+) ln1Out ffnOut
+ln2Out = map (layerNormForward ln2) residual2`,
     shapes: `Per token:  ℝ⁶⁴ → ℝ²⁵⁶ → ℝ⁶⁴
 (the 256-dim hidden is cached for backprop)`,
   },
   {
-    id: "res2", label: "Residual #2 — Add", sub: "ln1Out + ffnOut",
-    color: C.cyan, bg: C.cyanBg, small: true,
-    what: `Same as Residual #1 but wrapping the FFN:
-  residual₂ᵢ = ln1Outᵢ + ffnOutᵢ`,
-    why: `Provides a gradient highway around the FFN and lets it learn incremental refinements rather than full representations from scratch.`,
-    params: `0 learnable parameters.`,
-    hs: `residual2 = zipWith (+) ln1Out ffnOut`,
-    shapes: `ℝ²ˣ⁶⁴ + ℝ²ˣ⁶⁴  →  ℝ²ˣ⁶⁴`,
-  },
-  {
-    id: "ln2", label: "LayerNorm #2", sub: "γ, β ∈ ℝ⁶⁴",
-    color: C.green, bg: C.greenBg,
-    what: `Same operation as LN1 — normalize then affine transform — but with its own separate learned γ and β.`,
-    why: `Normalises the signal before the classifier head so the unembed projection receives inputs with stable mean and variance regardless of how large or small the FFN outputs become during training.`,
-    params: `γ (gamma)   64 params
-β (beta)    64 params
-──────────────────────
-Subtotal       128`,
-    hs: `ln2Pairs = map (layerNormForward ln2) residual2
-ln2Out   = map fst ln2Pairs`,
-    shapes: `Per token:  ℝ⁶⁴ → ℝ⁶⁴  (normalised)`,
-  },
-  {
-    id: "readout", label: "First-Token Readout", sub: "head ln2Out  →  ℝ⁶⁴",
-    color: C.yellow, bg: C.yellowBg, small: true,
-    what: `Discard token 1 entirely. Only token 0's final representation is passed to the classifier.`,
-    why: `Token 0 is designated as the "answer" position — similar to BERT's [CLS] token. Through attention, token 0 has already gathered all the information it needs from token 1 (the second operand).
-
-Using just one token also halves the unembed parameters (53×64 instead of 53×128 if we concatenated both).`,
-    params: `0 learnable parameters — just list indexing.`,
-    hs: `readout = head ln2Out
--- Haskell 'head' = first element of list`,
-    shapes: `[token₀, token₁]  ∈  ℝ²ˣ⁶⁴
-              ↓  take position 0
-         token₀  ∈  ℝ⁶⁴`,
-  },
-  {
-    id: "unembed", label: "Unembed / Classifier + Softmax", sub: "Linear 64 → 53  then softmax → Δ⁵²",
+    id: "unembed", label: "Unembed", sub: "Linear 64 → 53 + Softmax",
     color: C.pink, bg: C.pinkBg,
-    what: `A single linear layer projects from ℝ⁶⁴ to ℝ⁵³ (one logit per possible answer class). Softmax converts raw logits to a valid probability distribution over [0..52].
+    what: `First, take only token 0's representation (the "answer" position).
 
-  logits = W · readout + b          (64 → 53)
-  probs  = softmax(logits)
+Then a single linear layer projects from ℝ⁶⁴ to ℝ⁵³ (one logit per possible answer class). Softmax converts raw logits to a valid probability distribution over [0..52].
 
-The predicted answer = argmax(probs).`,
-    why: `This "decodes" the model's internal 64-dim representation back into the answer space. Each of the 53 outputs corresponds to one residue class mod 53. The softmax ensures probabilities sum to 1, making the loss well-defined.`,
+  readout = head tokens           (take token 0)
+  logits = W · readout + b        (64 → 53)
+  probs  = softmax(logits)`,
+    why: `This "decodes" the model's internal 64-dim representation back into the answer space. Each of the 53 outputs corresponds to one residue class mod 53. The softmax ensures probabilities sum to 1, making the loss well-defined.
+
+Token 0 is designated as the "answer" position — through attention, it has already gathered all the information it needs from token 1.`,
     params: `W  53×64 + b 53  =  3,445
 ────────────────────────────
 Subtotal            3,445`,
-    hs: `logits = linearForward unembed readout
+    hs: `readout = head ln2Out  -- first token only
+logits = linearForward unembed readout
 probs  = softmax logits`,
-    shapes: `ℝ⁶⁴  →  logits ∈ ℝ⁵³  →  probs ∈ Δ⁵²
+    shapes: `ℝ²ˣ⁶⁴  →  ℝ⁶⁴ (token 0)  →  logits ∈ ℝ⁵³  →  probs ∈ Δ⁵²
 (Δ⁵² = probability simplex, sums to 1)`,
   },
   {
-    id: "loss", label: "Cross-Entropy Loss", sub: "−log p_target  →  scalar ∈ ℝ",
-    color: "#8899aa", bg: "#111520",
-    what: `loss = −log(p_target)
+    id: "result", label: "Result", sub: "argmax(probs) → (a + b) mod 53",
+    color: C.green, bg: C.greenBg,
+    what: `The predicted answer is simply the argmax of the probability distribution:
 
-where p_target is the softmax probability the model assigns to the correct answer (a+b) mod 53. The value is clamped: max(1e-12, p) for numerical safety.
+  prediction = argmax(probs)
 
-This is the scalar that gets minimised by AdamW via backpropagation through the entire graph above.`,
-    why: `Cross-entropy is the standard classification objective. It heavily penalises confident wrong predictions (when p_target ≈ 0 the loss → ∞) while rewarding confident correct ones (when p_target → 1 the loss → 0).
+During training, cross-entropy loss is computed:
+  loss = −log(p_target)
 
-Gradient w.r.t. logits = (probs − one_hot), which is elegant and numerically stable. This gradient flows backward through every layer above.`,
-    params: `0 learnable parameters — it is the objective function, not a layer.`,
-    hs: `crossEntropyLoss probs target =
+where p_target is the probability assigned to the correct answer.
+
+AdamW optimizer computes gradients via backpropagation and updates all learnable parameters in Embed, Attention, MLP, and Unembed blocks.`,
+    why: `Cross-entropy penalises wrong predictions (p_target → 0 means loss → ∞).
+
+Backpropagation: compute ∂loss/∂θ for every parameter θ by applying the chain rule backwards through the network — from loss → unembed → MLP → attention → embedding.
+
+AdamW then uses these gradients to update parameters:
+• Adaptive lr + momentum → faster, stable convergence
+• Weight decay → critical for grokking; without it (wd ≈ 1e-3) the model memorizes but never generalizes`,
+    params: `0 learnable parameters (objective function)
+
+AdamW: β₁=0.9, β₂=0.999, wd=1e-3`,
+    hs: `-- inference
+prediction = maxIndex probs
+
+-- training loss
+crossEntropyLoss probs target =
   let p = max 1e-12 (probs ! target)
   in  negate (log p)
 
--- gradient w.r.t. logits (before softmax):
-crossEntropyGradLogits probs target =
-  probs - assoc n 0 [(target, 1)]`,
-    shapes: `probs ∈ ℝ⁵³  ×  target ∈ [0..52]
-              ↓
-         loss ∈ ℝ  (scalar)`,
+-- AdamW update (per parameter)
+adamW m v g t θ =
+  let m' = β1 * m + (1 - β1) * g
+      v' = β2 * v + (1 - β2) * g * g
+      mHat = m' / (1 - β1^t)
+      vHat = v' / (1 - β2^t)
+      θ'  = θ - lr * (mHat / (sqrt vHat + ε) + wd * θ)
+  in  (θ', m', v')`,
+    shapes: `probs ∈ Δ⁵²  →  prediction ∈ [0..52]
+              ↓  (training)
+         loss ∈ ℝ  (scalar)
+              ↓  backprop
+       ∇θ loss ∈ ℝ⁵⁶ᐧ⁹⁴⁹  (gradients for all params)
+              ↓  AdamW
+          Δθ  ∈ ℝ⁵⁶ᐧ⁹⁴⁹  (parameter updates)`,
   },
 ];
 
 const TOTAL_PARAMS = "56,949";
+
+/* param breakdown for info panel */
+const PARAM_BREAKDOWN = "Embed 3,520 · Attn 16,768 · MLP 33,216 · Unembed 3,445";
 
 /* ───────────────── info tabs ────────────────────────────────────── */
 const TABS = ["what", "why", "params", "shapes", "hs"];
@@ -265,8 +233,7 @@ function InfoPanel({ block }) {
         <div style={{ color: C.dim, marginBottom: 4 }}>Total learnable parameters</div>
         <div style={{ color: C.accent, fontSize: 16, fontWeight: 700 }}>{TOTAL_PARAMS}</div>
         <div style={{ color: C.dim, marginTop: 10, fontSize: 10.5, lineHeight: 1.7 }}>
-          Embed 3,520 · Attn 16,640 · LN×2 256
-          <br/>FFN 33,088 · Unembed 3,445
+          {PARAM_BREAKDOWN}
         </div>
       </div>
     </div>
@@ -328,76 +295,58 @@ function InfoPanel({ block }) {
 /* ───────────────────── SVG diagram ─────────────────────────────── */
 function Diagram({ selected, onSelect }) {
   const W = 560, cx = W / 2;
-  const bW = 330, sW = 250;
-  const bH = 44, sH = 34;
-  const gap = 6;
+  const bW = 330;
+  const bH = 54;
+  const gap = 8;
 
-  const Y = { embed:30, attn:118, res1:206, ln1:260, ffn:328, res2:416, ln2:470, readout:538, unembed:596, loss:684 };
+  const Y = { embed: 40, attn: 130, mlp: 220, unembed: 310, result: 400 };
 
-  function BRect({ id, y, w, sm }) {
+  function BRect({ id, y, w }) {
     const b = BLOCKS.find(b => b.id === id);
     const sel = selected === id;
-    const h = sm ? sH : bH;
     return (
       <g onClick={() => onSelect(id)} style={{ cursor: "pointer" }}>
-        <rect x={cx - w/2} y={y} width={w} height={h} rx={5}
+        <rect x={cx - w/2} y={y} width={w} height={bH} rx={6}
           fill={sel ? b.bg : C.card}
           stroke={sel ? b.color : C.bdr}
-          strokeWidth={sel ? 2 : 1}
+          strokeWidth={sel ? 2.5 : 1.5}
           style={{ transition: "all 0.15s" }} />
-        <text x={cx} y={y + (sm ? 14 : 18)} textAnchor="middle"
-          fill={b.color} fontSize={sm ? 11 : 12.5} fontWeight="600"
+        <text x={cx} y={y + 22} textAnchor="middle"
+          fill={b.color} fontSize={14} fontWeight="700"
           fontFamily="'JetBrains Mono','Fira Code',monospace">
           {b.label}
         </text>
-        {!sm && <text x={cx} y={y + 34} textAnchor="middle"
-          fill={C.dim} fontSize={9.5}
+        <text x={cx} y={y + 40} textAnchor="middle"
+          fill={C.dim} fontSize={10}
           fontFamily="'JetBrains Mono',monospace">
           {b.sub}
-        </text>}
+        </text>
       </g>
     );
   }
 
   function Arr({ y1, y2 }) {
     return <line x1={cx} y1={y1} x2={cx} y2={y2}
-      stroke={C.dim} strokeWidth={1.3} markerEnd="url(#ah)" />;
-  }
-
-  function ResArc({ y1, y2, label, side = 1 }) {
-    const off = side * 190;
-    const my = (y1 + y2) / 2;
-    return (
-      <g>
-        <path d={`M ${cx} ${y1} C ${cx+off} ${y1}, ${cx+off} ${y2}, ${cx} ${y2}`}
-          fill="none" stroke={C.res} strokeWidth={1.4} strokeDasharray="5,4" opacity={0.5} />
-        <circle cx={cx + off*0.52} cy={my} r={8} fill={C.bg} stroke={C.res} strokeWidth={1} />
-        <text x={cx + off*0.52} y={my + 3.5} textAnchor="middle"
-          fill={C.dim} fontSize={11} fontWeight="bold" fontFamily="monospace">+</text>
-        <text x={cx + off*0.73} y={my + 3} textAnchor={side > 0 ? "start" : "end"}
-          fill={C.dim} fontSize={8} fontFamily="monospace" opacity={0.5}>{label}</text>
-      </g>
-    );
+      stroke={C.dim} strokeWidth={1.5} markerEnd="url(#ah)" />;
   }
 
   function Dim({ x, y, text }) {
-    return <text x={x} y={y} fill={C.dim} fontSize={9}
-      fontFamily="'JetBrains Mono',monospace" opacity={0.5}>{text}</text>;
+    return <text x={x} y={y} fill={C.dim} fontSize={10}
+      fontFamily="'JetBrains Mono',monospace" opacity={0.6}>{text}</text>;
   }
 
-  const svgH = Y.loss + bH + 32;
-  const dX = cx + bW/2 + 12;
-  const dXs = cx + sW/2 + 12;
+  const svgH = Y.result + bH + 40;
+  const dX = cx + bW/2 + 14;
 
   return (
     <svg viewBox={`0 0 ${W} ${svgH}`} width="100%" style={{ display: "block" }}>
       <defs>
-        <marker id="ah" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
-          <polygon points="0 0, 7 2.5, 0 5" fill={C.dim} />
+        <marker id="ah" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill={C.dim} />
         </marker>
       </defs>
 
-      <text x={cx} y={20} textAnchor="middle" fill={C.bright} fontSize={12}
+      <text x={cx} y={24} textAnchor="middle" fill={C.bright} fontSize={13}
         fontFamily="'JetBrains Mono',monospace" fontWeight="700">
         Inputs:  a, b  ∈ [0..52]
       </text>
@@ -405,39 +354,45 @@ function Diagram({ selected, onSelect }) {
       <BRect id="embed"   y={Y.embed}   w={bW} />
       <Arr y1={Y.embed+bH+gap} y2={Y.attn-gap} />
       <BRect id="attn"    y={Y.attn}    w={bW} />
-      <Arr y1={Y.attn+bH+gap}  y2={Y.res1-gap} />
-      <BRect id="res1"    y={Y.res1}    w={sW} sm />
-      <Arr y1={Y.res1+sH+gap}  y2={Y.ln1-gap} />
-      <BRect id="ln1"     y={Y.ln1}     w={bW} />
-      <Arr y1={Y.ln1+bH+gap}   y2={Y.ffn-gap} />
-      <BRect id="ffn"     y={Y.ffn}     w={bW} />
-      <Arr y1={Y.ffn+bH+gap}   y2={Y.res2-gap} />
-      <BRect id="res2"    y={Y.res2}    w={sW} sm />
-      <Arr y1={Y.res2+sH+gap}  y2={Y.ln2-gap} />
-      <BRect id="ln2"     y={Y.ln2}     w={bW} />
-      <Arr y1={Y.ln2+bH+gap}   y2={Y.readout-gap} />
-      <BRect id="readout" y={Y.readout} w={sW} sm />
-      <Arr y1={Y.readout+sH+gap} y2={Y.unembed-gap} />
+      <Arr y1={Y.attn+bH+gap}  y2={Y.mlp-gap} />
+      <BRect id="mlp"     y={Y.mlp}     w={bW} />
+      <Arr y1={Y.mlp+bH+gap}   y2={Y.unembed-gap} />
       <BRect id="unembed" y={Y.unembed} w={bW} />
-      <Arr y1={Y.unembed+bH+gap} y2={Y.loss-gap} />
-      <BRect id="loss"    y={Y.loss}    w={bW} />
+      <Arr y1={Y.unembed+bH+gap} y2={Y.result-gap} />
+      <BRect id="result"  y={Y.result}  w={bW} />
 
-      <ResArc y1={Y.embed+bH/2} y2={Y.res1+sH/2} label="skip" side={1} />
-      <ResArc y1={Y.ln1+bH/2}   y2={Y.res2+sH/2} label="skip" side={-1} />
+      <Dim x={dX} y={Y.embed+32}   text="ℝ²ˣ⁶⁴" />
+      <Dim x={dX} y={Y.attn+32}    text="ℝ²ˣ⁶⁴" />
+      <Dim x={dX} y={Y.mlp+32}     text="ℝ²ˣ⁶⁴" />
+      <Dim x={dX} y={Y.unembed+32} text="ℝ⁵³" />
+      <Dim x={dX} y={Y.result+32}  text="[0..52]" />
 
-      <Dim x={dX}  y={Y.embed+28}  text="2 × ℝ⁶⁴" />
-      <Dim x={dX}  y={Y.attn+28}   text="2 × ℝ⁶⁴" />
-      <Dim x={dXs} y={Y.res1+22}   text="2 × ℝ⁶⁴" />
-      <Dim x={dX}  y={Y.ln1+28}    text="2 × ℝ⁶⁴" />
-      <Dim x={dX}  y={Y.ffn+28}    text="2 × ℝ⁶⁴" />
-      <Dim x={dXs} y={Y.res2+22}   text="2 × ℝ⁶⁴" />
-      <Dim x={dX}  y={Y.ln2+28}    text="2 × ℝ⁶⁴" />
-      <Dim x={dXs} y={Y.readout+22} text="ℝ⁶⁴" />
-      <Dim x={dX}  y={Y.unembed+28} text="ℝ⁵³ → Δ⁵²" />
-      <Dim x={dX}  y={Y.loss+28}    text="scalar" />
+      {/* AdamW backpropagation arrow */}
+      <defs>
+        <marker id="ah-back" markerWidth="8" markerHeight="6" refX="1" refY="3" orient="auto">
+          <polygon points="8 0, 0 3, 8 6" fill={C.orange} />
+        </marker>
+      </defs>
+      <path
+        d={`M ${cx - bW/2 - 20} ${Y.result + bH/2}
+            L ${cx - bW/2 - 20} ${Y.embed + bH/2}`}
+        fill="none"
+        stroke={C.orange}
+        strokeWidth={2}
+        strokeDasharray="6,4"
+        markerEnd="url(#ah-back)"
+        opacity={0.7}
+      />
+      <text
+        transform={`translate(${cx - bW/2 - 32}, ${(Y.embed + Y.result + bH) / 2}) rotate(-90)`}
+        textAnchor="middle" fill={C.orange} fontSize={10}
+        fontFamily="'JetBrains Mono',monospace"
+        opacity={0.8}>
+        AdamW backprop
+      </text>
 
-      <text x={cx} y={svgH - 5} textAnchor="middle" fill={C.bright} fontSize={11}
-        fontFamily="'JetBrains Mono',monospace" opacity={0.5}>
+      <text x={cx} y={svgH - 8} textAnchor="middle" fill={C.bright} fontSize={12}
+        fontFamily="'JetBrains Mono',monospace" opacity={0.6}>
         prediction:  (a + b) mod 53
       </text>
     </svg>

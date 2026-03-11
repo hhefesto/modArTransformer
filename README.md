@@ -12,7 +12,7 @@ nix run
 cabal run modArTransformer
 ```
 
-Saves checkpoints to `checkpoint.ckpt`.
+Saves checkpoints to `checkpoint.ckpt`. Remove this file to start training from scratch.
 
 ## Interactive Diagram
 

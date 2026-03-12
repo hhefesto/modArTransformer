@@ -20,7 +20,7 @@ Saves checkpoints to `checkpoint.ckpt`. Remove this file to start training from 
 
 ```bash
 # With nix
-nix run .#diagram-purs
+nix run .#diagram
 
 # Or from nix develop
 cd purescript

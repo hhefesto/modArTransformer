@@ -2,9 +2,14 @@
   description = "Minimal transformer for modular arithmetic — Haskell + hmatrix";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
     haskell-flake.url = "github:srid/haskell-flake";
+    # PureScript tooling
+    purescript-overlay = {
+      url = "github:thomashoneyman/purescript-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = inputs:
@@ -15,7 +20,14 @@
         inputs.haskell-flake.flakeModule
       ];
 
-      perSystem = { self', pkgs, config, ... }: {
+      perSystem = { self', config, system, ... }:
+      let
+        pkgs = import inputs.nixpkgs {
+          inherit system;
+          overlays = [ inputs.purescript-overlay.overlays.default ];
+        };
+      in {
+        _module.args.pkgs = pkgs;
         haskellProjects.default = {
           basePackages = pkgs.haskellPackages;
 
@@ -49,8 +61,12 @@
 
         apps.diagram = {
           type = "app";
-          program = toString (pkgs.writeShellScript "run-diagram" ''
-            exec ${pkgs.nodejs}/bin/npx vite "$@"
+          program = toString (pkgs.writeShellScript "run-diagram-purs" ''
+            cd purescript
+            echo "Building PureScript..."
+            ${pkgs.spago-unstable}/bin/spago bundle
+            echo "Starting server at http://localhost:8080"
+            ${pkgs.darkhttpd}/bin/darkhttpd . --port 8080
           '');
         };
 
@@ -65,8 +81,10 @@
             pkg-config
             esbuild
             python3
-            # nodejs_20
-            nodejs
+            # PureScript (from purescript-overlay)
+            spago-unstable
+            purs-unstable
+            darkhttpd
           ];
         });
       };

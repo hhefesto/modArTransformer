@@ -1,0 +1,19 @@
+workspace:
+  packageSet:
+    registry: "47.0.0"
+
+package:
+  name: transformer-diagram
+  dependencies:
+    - prelude
+    - effect
+    - console
+    - halogen
+    - halogen-svg-elems
+    - aff
+    - arrays
+    - maybe
+    - foldable-traversable
+    - strings
+    - web-html
+    - web-dom

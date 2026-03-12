@@ -27,7 +27,11 @@ result-*
 
 .direnv
 
-# Node.js / Vite
-node_modules/
-.vite/
+# PureScript / Spago
+purescript/.purs-repl
+purescript/.psci
+purescript/.pulp-cache/
+purescript/.psc-package/
+purescript/.spago/
+purescript/output/
 

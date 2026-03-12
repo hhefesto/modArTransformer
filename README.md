@@ -20,14 +20,16 @@ Saves checkpoints to `checkpoint.ckpt`. Remove this file to start training from 
 
 ```bash
 # With nix
-nix run .#diagram
+nix run .#diagram-purs
 
 # Or from nix develop
-npm install
-npx vite
+cd purescript
+spago bundle
+
+darkhttpd . --port 8080
 ```
 
-Opens at http://localhost:5173 — click any block to explore what it does, parameter counts, tensor shapes, and the Haskell implementation.
+Opens at http://localhost:8080 — click any block to explore what it does, parameter counts, tensor shapes, and the Haskell implementation.
 
 ## References
 

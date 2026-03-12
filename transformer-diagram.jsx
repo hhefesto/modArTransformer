@@ -34,9 +34,11 @@ const BLOCKS = [
     what: `Each integer a, b ∈ [0..52] is looked up in a learned embedding table (53 rows × 64 cols) to produce a dense 64-dim vector. A separate positional embedding (2 rows × 64 cols) is added so the model knows which operand is which.
 
 Both tables are learned end-to-end via backpropagation — there is no hand-designed encoding.`,
-    why: `Raw integers carry no geometric structure. The embedding gives each number a rich learned representation where modular-arithmetic patterns (like periodicity mod 53) can emerge as directions in ℝ⁶⁴.
+    why: `Raw integers carry no geometric structure. The embedding gives each number a rich learned representation where modular-arithmetic patterns can emerge as directions in ℝ⁶⁴.
 
-Position embedding breaks the permutation symmetry that attention would otherwise have — without it the model couldn't distinguish (a, b) from (b, a).`,
+What the model learns: Research shows these models encode numbers as points on circles — the embeddings learn Fourier components of modular arithmetic. Addition mod 53 becomes rotation in this learned space.
+
+Position embedding breaks symmetry — without it the model couldn't distinguish (a, b) from (b, a).`,
     params: `tokEmbed  53 × 64  =  3,392
 posEmbed   2 × 64  =    128
 ─────────────────────────────
@@ -56,14 +58,19 @@ x1   = embB + (posEmbed LA.! 1)
     what: `Every token is linearly projected into a Query, Key, and Value:
   Q = Wq·x + bq,   K = Wk·x + bk,   V = Wv·x + bv
 
-Dot-product scores QKᵀ/√64 form a 2×2 attention matrix. After row-wise softmax, each token's output is a weighted sum of Values, projected through Wₒ:
-  attended = softmax(QKᵀ/√dₖ) · V
-  out = Wₒ · attended + bₒ
+Dot-product scores QKᵀ/√64 form a 2×2 attention matrix:
 
-Includes residual connection and LayerNorm (post-norm). No causal mask — both tokens see each other.`,
-    why: `This is the only place the two operands exchange information. The 2×2 attention matrix controls how much of operand b's representation gets mixed into operand a's (and vice versa).
+        attends to:
+            tok₀   tok₁
+  tok₀ │  0.3    0.7  │  ← tok₀ gets 70% of tok₁'s info
+  tok₁ │  0.6    0.4  │  ← tok₁ gets 60% of tok₀'s info
 
-With no causal mask both tokens see each other freely — this is appropriate because addition is commutative and both operands are needed equally.`,
+After softmax, each row sums to 1. Each token's output is a weighted sum of Values, projected through Wₒ.
+
+Includes residual connection and LayerNorm (post-norm).`,
+    why: `The two numbers need to "talk" to compute their sum. Attention is the only place this happens — the MLP processes each token independently.
+
+The 2×2 attention matrix controls how much of operand b's representation gets mixed into operand a's (and vice versa). No causal mask — both tokens see each other freely, appropriate since addition is commutative.`,
     params: `Wq  64×64 + bq 64  =  4,160
 Wk  64×64 + bk 64  =  4,160
 Wv  64×64 + bv 64  =  4,160
@@ -155,12 +162,16 @@ probs  = softmax logits`,
 
   prediction = argmax(probs)
 
-During training, cross-entropy loss is computed:
-  loss = −log(p_target)
+During training, cross-entropy loss = −log(p_target).
 
-where p_target is the probability assigned to the correct answer.
+THE GROKKING PHENOMENON:
+The model first memorizes the training set:
+  → ~95% train accuracy, ~0% test accuracy
 
-AdamW optimizer computes gradients via backpropagation and updates all learnable parameters in Embed, Attention, MLP, and Unembed blocks.`,
+Then, after many more epochs, it suddenly generalizes:
+  → ~99% train accuracy, ~99% test accuracy
+
+This phase transition requires weight decay — without it, the model stays stuck in memorization forever.`,
     why: `Cross-entropy penalises wrong predictions (p_target → 0 means loss → ∞).
 
 Backpropagation: compute ∂loss/∂θ for every parameter θ by applying the chain rule backwards through the network — from loss → unembed → MLP → attention → embedding.

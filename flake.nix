@@ -59,14 +59,17 @@
           program = "${self'.packages.modArTransformer}/bin/modArTransformer";
         };
 
+        packages.diagram = pkgs.runCommand "transformer-diagram" {} ''
+          mkdir -p $out
+          cp ${./purescript/index.html} $out/index.html
+          cp ${./purescript/index.js} $out/index.js
+        '';
+
         apps.diagram = {
           type = "app";
           program = toString (pkgs.writeShellScript "run-diagram-purs" ''
-            cd purescript
-            echo "Building PureScript..."
-            ${pkgs.spago-unstable}/bin/spago bundle
             echo "Starting server at http://localhost:8080"
-            ${pkgs.darkhttpd}/bin/darkhttpd . --port 8080
+            ${pkgs.darkhttpd}/bin/darkhttpd ${self'.packages.diagram} --port 8080
           '');
         };
 

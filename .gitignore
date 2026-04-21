@@ -27,6 +27,11 @@ result-*
 
 .direnv
 
+# Agda
+*.agdai
+MAlonzo/
+modArTransformer-agda
+
 # PureScript / Spago
 purescript/.purs-repl
 purescript/.psci

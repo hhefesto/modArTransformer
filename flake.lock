@@ -1,6 +1,38 @@
 {
   "nodes": {
+    "felix": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1776665653,
+        "narHash": "sha256-evYncE3IOznGEr3Uh1VyeO0G3XGoFV6IM6+i9PhJ5ZI=",
+        "owner": "conal",
+        "repo": "felix",
+        "rev": "6f36d28097db7ea5f5df3263db3e8be08f74e490",
+        "type": "github"
+      },
+      "original": {
+        "owner": "conal",
+        "repo": "felix",
+        "type": "github"
+      }
+    },
     "flake-compat": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1767039857,
+        "narHash": "sha256-vNpUSpF5Nuw8xvDLj2KCwwksIbjua2LZCqhV1LNRDns=",
+        "owner": "edolstra",
+        "repo": "flake-compat",
+        "rev": "5edf11c44bc78a0d334f6334cdaf7d60d732daab",
+        "type": "github"
+      },
+      "original": {
+        "owner": "edolstra",
+        "repo": "flake-compat",
+        "type": "github"
+      }
+    },
+    "flake-compat_2": {
       "flake": false,
       "locked": {
         "lastModified": 1765121682,
@@ -82,7 +114,7 @@
     },
     "purescript-overlay": {
       "inputs": {
-        "flake-compat": "flake-compat",
+        "flake-compat": "flake-compat_2",
         "nixpkgs": [
           "nixpkgs"
         ]
@@ -103,6 +135,8 @@
     },
     "root": {
       "inputs": {
+        "felix": "felix",
+        "flake-compat": "flake-compat",
         "flake-parts": "flake-parts",
         "haskell-flake": "haskell-flake",
         "nixpkgs": "nixpkgs",

@@ -16,6 +16,17 @@ Saves checkpoints to `checkpoint.ckpt`. Remove this file to start training from 
 
 **Note:** Achieving 99% test accuracy required tuning the weight decay parameter (`wd = 1e-3` in `Main.hs`).
 
+## Agda Memory Guard
+
+When running Agda tooling, use the guard wrapper so the process stays under 80% RAM and automatically retries once after an OOM:
+
+```bash
+./scripts/agda-guard.sh agda modArTransformer.agda
+./scripts/agda-guard.sh agda --compile modArTransformer.agda
+```
+
+The Agda training loop now prints `epoch | loss` every epoch and writes `checkpoint.ckpt` every 10 epochs.
+
 ## Interactive Diagram
 
 ```bash

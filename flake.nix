@@ -96,10 +96,10 @@
               shellHook = ''
                 export LOCALE_ARCHIVE="${pkgs.glibcLocales}/lib/locale/locale-archive"
                 export LC_ALL="en_US.UTF-8"
-                echo "Agda ready. Type-check with:"
-                echo "  agda modArTransformer.agda"
+                echo "Agda ready with memory guard. Type-check with:"
+                echo "  ./scripts/agda-guard.sh agda modArTransformer.agda"
                 echo "Compile with:"
-                echo "  agda --compile modArTransformer.agda"
+                echo "  ./scripts/agda-guard.sh agda --compile modArTransformer.agda"
               '';
             };
           };
@@ -121,7 +121,7 @@
             buildPhase = ''
               cp -r ${inputs.felix}/src felix-src
               chmod -R u+w felix-src
-              agda -i ${stdlib}/src -i felix-src --compile modArTransformer.agda
+              bash ./scripts/agda-guard.sh agda -i ${stdlib}/src -i felix-src --compile modArTransformer.agda
             '';
             installPhase = ''
               mkdir -p $out/bin
@@ -141,7 +141,7 @@
             buildPhase = ''
               cp -r ${inputs.felix}/src felix-src
               chmod -R u+w felix-src
-              agda -i ${stdlib}/src -i felix-src modArTransformer.agda
+              bash ./scripts/agda-guard.sh agda -i ${stdlib}/src -i felix-src modArTransformer.agda
             '';
             installPhase = ''
               mkdir -p $out
@@ -151,7 +151,9 @@
 
         apps.default = {
           type = "app";
-          program = "${self'.packages.agda-modArTransformer}/bin/agda-modArTransformer";
+          program = toString (pkgs.writeShellScript "run-agda-modArTransformer-guarded" ''
+            exec ${pkgs.bash}/bin/bash ${./scripts/agda-guard.sh} ${self'.packages.agda-modArTransformer}/bin/agda-modArTransformer "$@"
+          '');
         };
 
         apps.haskell = {
@@ -161,7 +163,9 @@
 
         apps.agda-modArTransformer = {
           type = "app";
-          program = "${self'.packages.agda-modArTransformer}/bin/agda-modArTransformer";
+          program = toString (pkgs.writeShellScript "run-agda-modArTransformer-guarded-app" ''
+            exec ${pkgs.bash}/bin/bash ${./scripts/agda-guard.sh} ${self'.packages.agda-modArTransformer}/bin/agda-modArTransformer "$@"
+          '');
         };
 
         packages.diagram = pkgs.runCommand "transformer-diagram" {} ''

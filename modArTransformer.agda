@@ -44,6 +44,7 @@ private
   batchSize : ℕ ; batchSize = 32
   epochs    : ℕ ; epochs    = 500000
   seed0     : ℕ ; seed0     = 42
+  checkpointEvery : ℕ ; checkpointEvery = 10
 
   baseLR   : Float ; baseLR  = 1.0e-3
   minLR    : Float ; minLR   = 1.0e-5
@@ -63,12 +64,14 @@ private
 postulate
   primDoesFileExist : String → Prim.IO Bool
   primReadFile      : String → Prim.IO String
+  primWriteFile     : String → String → Prim.IO Unit
   primHFlushStdout  : Prim.IO Unit
 
 {-# FOREIGN GHC import qualified Data.Text as T #-}
 
 {-# COMPILE GHC primDoesFileExist = \p -> doesFileExist (T.unpack p) #-}
 {-# COMPILE GHC primReadFile      = \p -> fmap T.pack (readFile (T.unpack p)) #-}
+{-# COMPILE GHC primWriteFile     = \p s -> writeFile (T.unpack p) (T.unpack s) #-}
 {-# COMPILE GHC primHFlushStdout  = hFlush stdout #-}
 
 doesFileExistIO : String → IO Bool
@@ -76,6 +79,20 @@ doesFileExistIO p = lift (primDoesFileExist p)
 
 readFileIO : String → IO String
 readFileIO p = lift (primReadFile p)
+
+writeFileIO : String → String → IO Unit
+writeFileIO p s = lift (primWriteFile p s)
+
+flushStdoutIO : IO {0ℓ} ⊤
+flushStdoutIO = lift′ primHFlushStdout
+
+saveCheckpointIO : TransformerParams (suc p) dModel dFF dK → IO {0ℓ} ⊤
+saveCheckpointIO params = do
+  let floats = serializeParams (suc p) dModel dFF dK params
+      text   = floatsToString floats
+  _ ← writeFileIO "checkpoint.ckpt" text
+  putStrLn "[checkpoint] saved checkpoint.ckpt"
+  flushStdoutIO
 
 -- ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -101,18 +118,28 @@ trainLoop : ℕ    -- remaining epochs
           → IO {0ℓ} ⊤
 trainLoop zero    _     _      _    _  _  _ = putStrLn "Done." >> pure tt
 trainLoop (suc e) epoch params adam tr te g =
-  let (params' , adam' , loss , g') =
-        trainEpoch epoch batchSize warmupSteps baseLR minLR cfg params adam tr g
-      logLine = showN epoch ++ " | loss=" ++ showF loss
-             ++ " | train=" ++ pct (accuracy params' tr)
-             ++ " | test="  ++ pct (accuracy params' te)
-  in
-  (if (epoch % 100) Data.Nat.≡ᵇ 0
-    then putStrLn logLine
-    else pure tt)
-  >> trainLoop e (suc epoch) params' adam' tr te g'
+  continue (trainEpoch epoch batchSize warmupSteps baseLR minLR cfg params adam tr g)
   where
     open import Data.Nat using (_≡ᵇ_; _%_)
+
+    continue : TransformerParams (suc p) dModel dFF dK
+             × AdamState p dModel dFF dK
+             × Float × StdGen
+             → IO {0ℓ} ⊤
+    continue (params' , adam' , loss , g') =
+      let lossLine = showN epoch ++ " | loss=" ++ showF loss
+          evalLine = lossLine
+                  ++ " | train=" ++ pct (accuracy params' tr)
+                  ++ " | test="  ++ pct (accuracy params' te)
+      in
+      (if (epoch % 100) Data.Nat.≡ᵇ 0
+        then putStrLn evalLine
+        else putStrLn lossLine)
+      >> flushStdoutIO
+      >> (if (epoch % checkpointEvery) Data.Nat.≡ᵇ 0
+          then saveCheckpointIO params'
+          else pure tt)
+      >> trainLoop e (suc epoch) params' adam' tr te g'
 
 -- ─── Checkpoint loading helper with explicit types ────────────────────────────
 
@@ -127,11 +154,17 @@ loadOrInit true g0 = do
       as0               = initAdamState {p} {dModel} {dFF} {dK} 0.9 0.999
   putStrLn "Loaded checkpoint.ckpt"
   pure (params' , as0 , 1 , g0)
-loadOrInit false g0 = do
-  let (params' , g')    = initTransformer (suc p) dModel dFF dK seed0 g0
-      as0               = initAdamState {p} {dModel} {dFF} {dK} 0.9 0.999
-  putStrLn "Initialized fresh parameters"
-  pure (params' , as0 , 1 , g')
+loadOrInit false g0 =
+  continue (initTransformer (suc p) dModel dFF dK seed0 g0)
+  where
+    continue : TransformerParams (suc p) dModel dFF dK × StdGen
+             → IO {0ℓ} (TransformerParams (suc p) dModel dFF dK
+                       × AdamState p dModel dFF dK
+                       × ℕ × StdGen)
+    continue (params' , g') = do
+      let as0 = initAdamState {p} {dModel} {dFF} {dK} 0.9 0.999
+      putStrLn "Initialized fresh parameters"
+      pure (params' , as0 , 1 , g')
 
 -- ─── Main ─────────────────────────────────────────────────────────────────────
 

@@ -2,7 +2,7 @@ name: Deploy PureScript Diagram to GitHub Pages
 
 on:
   push:
-    branches: ["main"]
+    branches: ["master"]
     paths:
       - "purescript/index.html"
       - "purescript/index.js"

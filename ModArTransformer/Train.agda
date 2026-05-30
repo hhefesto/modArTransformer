@@ -1,134 +1,42 @@
+-- Training loop, rewired onto the new stack.  Per-example gradients come from
+-- `Cat.Grad.gradAndLoss (transformerLoss …)` (one chain rule, no bespoke
+-- pullbacks); batch gradients accumulate with the derived `Additive._⊕_`, scale
+-- by 1/n with `Scale`, and update via the generic `Adamable.adamStep`.
+-- Inference/accuracy run `eval (transformerLogits …)`.  Strictness uses the
+-- generic `Force.force` with the `seqBy`/`foldl'` FFI to bound memory.
 {-# OPTIONS --guardedness #-}
 module ModArTransformer.Train where
 
 open import Agda.Builtin.Float using (Float; primNatToFloat)
-open import Data.Nat     using (ℕ; zero; suc; _+_)
+open import Data.Nat     using (ℕ; zero; suc)
 open import Data.List    using (List; []; _∷_; length)
-open import Data.Product using (_×_; _,_)
+open import Data.Product using (_×_; _,_; proj₁; proj₂)
 open import Data.Bool    using (Bool; true; false; if_then_else_)
-open import Data.Vec.Base as Vec using (map)
-open import ModArTransformer.Tensor
-open import ModArTransformer.Additive
-open import ModArTransformer.AD.AddFun
-open import ModArTransformer.AD.Dual
-open import ModArTransformer.AD.Core
-open import ModArTransformer.Layers.Linear
-open import ModArTransformer.Layers.LayerNorm
-open import ModArTransformer.Layers.FFN
-open import ModArTransformer.Layers.Attention
+open import Data.Fin     using (Fin; toℕ)
+
+open import ModArTransformer.Tensor using (_f+_; _f/_; vmaxIndex)
+-- opened without `using` so their tensor/product instances are in scope:
+open import ModArTransformer.Cat.Additive
+open import ModArTransformer.Cat.AdditiveTensor
+open import ModArTransformer.Cat.Scale
+open import ModArTransformer.Cat.Adamable
+open import ModArTransformer.Cat.Force
+open import ModArTransformer.Cat.Grad      using (eval; gradAndLoss)
 open import ModArTransformer.Layers.Transformer
-open import ModArTransformer.Optimizer.Adam
-open import ModArTransformer.Optimizer.Schedule
-open import ModArTransformer.Data
-open import ModArTransformer.Random
-open import Data.Fin using (Fin; toℕ) renaming (zero to fz; suc to fs)
+  using (TransformerParams; transformerLoss; transformerLogits)
+open import ModArTransformer.Optimizer.Schedule using (lrWarmupCosine)
+open import ModArTransformer.Data   using (Example; shuffleList; chunksOf)
+open import ModArTransformer.Random using (StdGen)
+
+private variable p dModel dFF dK : ℕ
 
 -- Strict foldl backed by Haskell's Data.List.foldl' to prevent thunk buildup.
 {-# FOREIGN GHC import qualified Data.List as DL #-}
-
 postulate
   foldl' : {A B : Set} → (A → B → A) → A → List B → A
   seqBy  : {A B : Set} → A → B → B
-
 {-# COMPILE GHC foldl' = \ _ _ f z xs -> DL.foldl' f z xs #-}
 {-# COMPILE GHC seqBy  = \ _ _ x y -> seq x y #-}
-
-private
-  forceMat : {m n : ℕ} → ℝMat m n → Float
-  forceMat M = vsum (Vec.map vsum M)
-
-  forceLinear : {out inp : ℕ} → LinearParams out inp → Float
-  forceLinear p = forceMat (linW p) f+ vsum (linB p)
-
-  forceLN : {n : ℕ} → LayerNormParams n → Float
-  forceLN p = vsum (lnGamma p) f+ vsum (lnBeta p)
-
-  forceFFN : {dModel dFF : ℕ} → FFNParams dModel dFF → Float
-  forceFFN p = forceLinear (ffnLinear1 p) f+ forceLinear (ffnLinear2 p)
-
-  forceAttn : {dModel dK : ℕ} → AttentionParams dModel dK → Float
-  forceAttn p = forceLinear (attnWq p) f+
-                forceLinear (attnWk p) f+
-                forceLinear (attnWv p) f+
-                forceLinear (attnWo p)
-
-  forceTransformer : {p dModel dFF dK : ℕ}
-                   → TransformerParams (suc p) dModel dFF dK
-                   → Float
-  forceTransformer p = forceMat (tokEmbed p) f+
-                       forceMat (posEmbed p) f+
-                       forceAttn (attnP p) f+
-                       forceLN (ln1P p) f+
-                       forceFFN (ffnP p) f+
-                       forceLN (ln2P p) f+
-                       forceLinear (unembed p)
-
-  forceMatMoments : {m n : ℕ} → MatMoments m n → Float
-  forceMatMoments m = forceMat (MatMoments.mmM m) f+ forceMat (MatMoments.mmV m)
-
-  forceVecMoments : {n : ℕ} → VecMoments n → Float
-  forceVecMoments v = vsum (VecMoments.vmM v) f+ vsum (VecMoments.vmV v)
-
-  forceLinearMoments : {out inp : ℕ} → LinearMoments out inp → Float
-  forceLinearMoments m = forceMatMoments (LinearMoments.lmW m) f+
-                         forceVecMoments (LinearMoments.lmB m)
-
-  forceLNMoments : {n : ℕ} → LNMoments n → Float
-  forceLNMoments m = forceVecMoments (LNMoments.lnmGamma m) f+
-                     forceVecMoments (LNMoments.lnmBeta m)
-
-  forceAttnMoments : {dModel dK : ℕ} → AttnMoments dModel dK → Float
-  forceAttnMoments m = forceLinearMoments (AttnMoments.aqM m) f+
-                       forceLinearMoments (AttnMoments.akM m) f+
-                       forceLinearMoments (AttnMoments.avM m) f+
-                       forceLinearMoments (AttnMoments.aoM m)
-
-  forceAdamState : {p dModel dFF dK : ℕ} → AdamState p dModel dFF dK → Float
-  forceAdamState a = primNatToFloat (AdamState.adamT a) f+
-                     AdamState.adamB1t a f+
-                     AdamState.adamB2t a f+
-                     forceMatMoments (AdamState.mTokEmb a) f+
-                     forceMatMoments (AdamState.mPosEmb a) f+
-                     forceAttnMoments (AdamState.mAttn a) f+
-                     forceLNMoments (AdamState.mLn1 a) f+
-                     forceLinearMoments (AdamState.mFFN1 a) f+
-                     forceLinearMoments (AdamState.mFFN2 a) f+
-                     forceLNMoments (AdamState.mLn2 a) f+
-                     forceLinearMoments (AdamState.mUnembed a)
-
-  strictBatchAcc : {p dModel dFF dK : ℕ}
-                 → TransformerParams (suc p) dModel dFF dK × Float
-                 → TransformerParams (suc p) dModel dFF dK × Float
-  strictBatchAcc acc@(g , l) = seqBy (forceTransformer g f+ l) acc
-
-  strictTrainAcc : {p dModel dFF dK : ℕ}
-                 → TransformerParams (suc p) dModel dFF dK
-                 × AdamState p dModel dFF dK
-                 × Float
-                 → TransformerParams (suc p) dModel dFF dK
-                 × AdamState p dModel dFF dK
-                 × Float
-  strictTrainAcc acc@(p , a , l) = seqBy (forceTransformer p f+ forceAdamState a f+ l) acc
-
--- ─── Inference: argmax of logits ─────────────────────────────────────────────
-
-inferInfix : {p dModel dFF dK : ℕ}
-           → TransformerParams (suc p) dModel dFF dK
-           → Fin (suc p) → Fin (suc p)
-           → Fin (suc p)
-inferInfix params a b =
-  let e0 = mrow (tokEmbed params) a v+ mrow (posEmbed params) fz
-      e1 = mrow (tokEmbed params) b v+ mrow (posEmbed params) (fs fz)
-      ((a0 , _) , _) = run attnD (attnP params , (e0 , e1))
-      r10 = e0 v+ a0
-      (n10 , _) = run layerNormD (ln1P params , r10)
-      (f0  , _) = run ffnD (ffnP params , n10)
-      r20 = n10 v+ f0
-      (o0  , _) = run layerNormD (ln2P params , r20)
-      logits = linW (unembed params) #> o0 v+ linB (unembed params)
-  in  vmaxIndex logits
-
--- ─── Accuracy ─────────────────────────────────────────────────────────────────
 
 private
   natEq : ℕ → ℕ → Bool
@@ -137,166 +45,73 @@ private
   natEq (suc _) zero    = false
   natEq (suc m) (suc n) = natEq m n
 
-accuracy : {p dModel dFF dK : ℕ}
-         → TransformerParams (suc p) dModel dFF dK
-         → List (Example (suc p))
-         → Float
+Params : ℕ → ℕ → ℕ → ℕ → Set
+Params p dModel dFF dK = TransformerParams p dModel dFF dK
+
+-- ─── Inference / accuracy ─────────────────────────────────────────────────────
+
+inferInfix : Params p dModel dFF dK → Fin (suc p) → Fin (suc p) → Fin (suc p)
+inferInfix params a b = vmaxIndex (eval (transformerLogits a b) params)
+
+accuracy : Params p dModel dFF dK → List (Example (suc p)) → Float
 accuracy _      [] = 0.0
 accuracy params xs =
   let correct = foldl' (λ acc ex →
         let pred = inferInfix params (Example.exA ex) (Example.exB ex)
-        in  if natEq (toℕ pred) (toℕ (Example.exTarget ex))
-              then suc acc else acc)
+        in  if natEq (toℕ pred) (toℕ (Example.exTarget ex)) then suc acc else acc)
         0 xs
   in  primNatToFloat correct f/ primNatToFloat (length xs)
 
--- ─── Single-example gradient (the Conal AD call) ─────────────────────────────
+-- ─── Per-example gradient + loss (the Conal AD call) ──────────────────────────
 
-private
-  unpackGradLoss : {p dModel dFF dK : ℕ}
-                 → Float × Dual AddFun (TransformerParams (suc p) dModel dFF dK) Float
-                 → TransformerParams (suc p) dModel dFF dK × Float
-  unpackGradLoss (loss , mkDual (mkAddFun pb)) = (pb 1.0 , loss)
-
-exampleGradLoss : {p dModel dFF dK : ℕ}
-                → TransformerParams (suc p) dModel dFF dK
-                → Example (suc p)
-                → TransformerParams (suc p) dModel dFF dK × Float
+exampleGradLoss : Params p dModel dFF dK → Example (suc p)
+                → Params p dModel dFF dK × Float
 exampleGradLoss params ex =
-  unpackGradLoss
-    (run (transformerD (Example.exA ex) (Example.exB ex) (Example.exTarget ex)) params)
+  gradAndLoss (transformerLoss (Example.exA ex) (Example.exB ex) (Example.exTarget ex)) params
 
--- ─── Batch training step (Main.hs:866-913) ────────────────────────────────────
-
-private
-  addGradLoss : {p dModel dFF dK : ℕ}
-              → TransformerParams (suc p) dModel dFF dK × Float
-              → TransformerParams (suc p) dModel dFF dK × Float
-              → TransformerParams (suc p) dModel dFF dK × Float
-  addGradLoss (accG , accL) (g , l) = (addTransformer accG g , accL f+ l)
-
-  batchStep : {p dModel dFF dK : ℕ}
-            → TransformerParams (suc p) dModel dFF dK
-            → TransformerParams (suc p) dModel dFF dK × Float
-            → Example (suc p)
-            → TransformerParams (suc p) dModel dFF dK × Float
-  batchStep params acc ex = strictBatchAcc (addGradLoss acc (exampleGradLoss params ex))
-
-  finishBatch : {p dModel dFF dK : ℕ}
-              → Float → AdamConfig → Float → Float
-              → TransformerParams (suc p) dModel dFF dK
-              → AdamState p dModel dFF dK
-              → ℕ
-              → TransformerParams (suc p) dModel dFF dK × Float
-              → TransformerParams (suc p) dModel dFF dK
-              × AdamState p dModel dFF dK
-              × Float
-  finishBatch {p} {dModel} {dFF} {dK} lr cfg b1t b2t params adam n (totalGrad , totalLoss) =
-    continue (adamStep lr cfg b1t b2t params
-                       (scaleTransformer (fone f/ primNatToFloat n) totalGrad)
-                       adam)
-    where
-      continue : TransformerParams (suc p) dModel dFF dK × AdamState p dModel dFF dK
-               → TransformerParams (suc p) dModel dFF dK
-               × AdamState p dModel dFF dK
-               × Float
-      continue (params' , adam') = strictTrainAcc (params' , adam' , totalLoss f/ primNatToFloat n)
-
-trainBatch : {p dModel dFF dK : ℕ}
-           → Float → AdamConfig → Float → Float → ℕ
-           → TransformerParams (suc p) dModel dFF dK
-           → AdamState p dModel dFF dK
-           → List (Example (suc p))
-           → TransformerParams (suc p) dModel dFF dK
-           × AdamState p dModel dFF dK
-           × Float
-trainBatch _  _   _   _   _  params adam [] = (params , adam , 0.0)
-trainBatch lr cfg b1t b2t totalSteps params adam batch =
-  let totals = foldl' (batchStep params) (zeroTransformer , 0.0) batch
-  in  finishBatch lr cfg b1t b2t params adam (length batch) totals
-
--- ─── One epoch (Main.hs:915-935) ─────────────────────────────────────────────
+-- ─── Batch step: accumulate grads, average, Adam update ───────────────────────
 
 private
-  epochStep : {p dModel dFF dK : ℕ}
-            → Float → AdamConfig → Float → Float → ℕ
-            → TransformerParams (suc p) dModel dFF dK
-            × AdamState p dModel dFF dK
-            × Float
-            → List (Example (suc p))
-            → TransformerParams (suc p) dModel dFF dK
-            × AdamState p dModel dFF dK
-            × Float
-  epochStep {p} {dModel} {dFF} {dK} lr cfg b1t b2t totalSteps (params0 , adam0 , l) batch =
-    continue (trainBatch lr cfg b1t b2t totalSteps params0 adam0 batch)
-    where
-      continue : TransformerParams (suc p) dModel dFF dK
-               × AdamState p dModel dFF dK
-               × Float
-               → TransformerParams (suc p) dModel dFF dK
-               × AdamState p dModel dFF dK
-               × Float
-      continue (params' , adam' , bl) = strictTrainAcc (params' , adam' , l f+ bl)
+  batchAcc : Params p dModel dFF dK
+           → Params p dModel dFF dK × Float → Example (suc p)
+           → Params p dModel dFF dK × Float
+  batchAcc params acc ex =
+    let gl   = exampleGradLoss params ex
+        acc' = (proj₁ acc ⊕ proj₁ gl , proj₂ acc f+ proj₂ gl)
+    in  seqBy (force (proj₁ acc') f+ proj₂ acc') acc'
 
-  finishEpoch : {p dModel dFF dK : ℕ}
-              → StdGen
-              → List (List (Example (suc p)))
-              → TransformerParams (suc p) dModel dFF dK
-              × AdamState p dModel dFF dK
-              × Float
-              → TransformerParams (suc p) dModel dFF dK
-              × AdamState p dModel dFF dK
-              × Float × StdGen
-  finishEpoch g1 batches (params' , adam' , totalLoss) =
-    (params' , adam' , meanLoss , g1)
-    where
-      nBatches : ℕ
-      nBatches = length batches
-
-      meanLoss : Float
-      meanLoss = if natEq nBatches 0 then 0.0
-                 else totalLoss f/ primNatToFloat nBatches
-
-trainEpoch : {p dModel dFF dK : ℕ}
-           → ℕ      -- epoch number
-           → ℕ      -- batch size
-           → ℕ      -- warmup steps
-           → Float  -- base LR
-           → Float  -- min LR
-           → AdamConfig
-           → TransformerParams (suc p) dModel dFF dK
-           → AdamState p dModel dFF dK
+trainBatch : Float → AdamConfig
+           → Params p dModel dFF dK → AdamState (Params p dModel dFF dK)
            → List (Example (suc p))
-           → StdGen
-           → TransformerParams (suc p) dModel dFF dK
-           × AdamState p dModel dFF dK
-           × Float × StdGen
-trainEpoch {p} {dModel} {dFF} {dK} epoch bsz warmup baseLR minLR cfg params adam trainData g0 =
-  onShuffled (shuffleList trainData g0)
-  where
-    totalSteps : ℕ
-    totalSteps = 500000  -- matches Main.hs
+           → Params p dModel dFF dK × AdamState (Params p dModel dFF dK) × Float
+trainBatch _  _   params adam [] = (params , adam , 0.0)
+trainBatch lr cfg params adam batch =
+  let (gSum , lSum) = foldl' (batchAcc params) (zeroA , 0.0) batch
+      n        = primNatToFloat (length batch)
+      gAvg     = scaleA (1.0 f/ n) gSum
+      (params' , adam') = adamStep lr cfg params gAvg adam
+  in  seqBy (force params') (params' , adam' , lSum f/ n)
 
-    lr : Float
-    lr = lrWarmupCosine epoch warmup baseLR minLR totalSteps
+-- ─── One epoch: shuffle, chunk, fold batches ──────────────────────────────────
 
-    b1t : Float
-    b1t = AdamState.adamB1t adam
+private
+  epochAcc : Float → AdamConfig
+           → Params p dModel dFF dK × AdamState (Params p dModel dFF dK) × Float
+           → List (Example (suc p))
+           → Params p dModel dFF dK × AdamState (Params p dModel dFF dK) × Float
+  epochAcc lr cfg (params , adam , lacc) batch =
+    let (params' , adam' , bl) = trainBatch lr cfg params adam batch
+    in  seqBy (force params') (params' , adam' , lacc f+ bl)
 
-    b2t : Float
-    b2t = AdamState.adamB2t adam
-
-    onShuffled : List (Example (suc p)) × StdGen
-               → TransformerParams (suc p) dModel dFF dK
-               × AdamState p dModel dFF dK
-               × Float × StdGen
-    onShuffled (shuffled , g1) =
-      continue g1 (chunksOf bsz shuffled)
-      where
-        continue : StdGen → List (List (Example (suc p)))
-                 → TransformerParams (suc p) dModel dFF dK
-                 × AdamState p dModel dFF dK
-                 × Float × StdGen
-        continue g1 batches =
-          let totals = foldl' (epochStep lr cfg b1t b2t totalSteps) (params , adam , 0.0) batches
-          in  finishEpoch g1 batches totals
+trainEpoch : ℕ → ℕ → ℕ → Float → Float → AdamConfig
+           → Params p dModel dFF dK → AdamState (Params p dModel dFF dK)
+           → List (Example (suc p)) → StdGen
+           → Params p dModel dFF dK × AdamState (Params p dModel dFF dK) × Float × StdGen
+trainEpoch epoch bsz warmup baseLR minLR cfg params adam trainData g0 =
+  let (shuffled , g1) = shuffleList trainData g0
+      batches  = chunksOf bsz shuffled
+      lr       = lrWarmupCosine epoch warmup baseLR minLR 500000
+      (params' , adam' , lossSum) =
+        foldl' (epochAcc lr cfg) (params , adam , 0.0) batches
+      nB = length batches
+  in  (params' , adam' , (if natEq nB 0 then 0.0 else lossSum f/ primNatToFloat nB) , g1)

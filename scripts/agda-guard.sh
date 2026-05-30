@@ -28,20 +28,25 @@ detect_mem_total_kb() {
   printf '%s\n' 4194304
 }
 
+# Virtual-memory cap is OPT-IN.  Set AGDA_GUARD_VMEM_PCT to a percentage (e.g. 80)
+# to cap virtual memory at that fraction of RAM.  Default (unset/0) = no cap:
+# `ulimit -Sv` throttles GHC/Agda and was the cause of stalled builds.
+vmem_pct="${AGDA_GUARD_VMEM_PCT:-0}"
 mem_total_kb=$(detect_mem_total_kb)
-limit_kb=$((mem_total_kb * 80 / 100))
-limit_mb=$((limit_kb / 1024))
-
-if ((limit_mb < 256)); then
-  limit_mb=256
-  limit_kb=$((limit_mb * 1024))
+limit_kb=$(( mem_total_kb * vmem_pct / 100 ))
+if ((vmem_pct > 0)) && ((limit_kb < 262144)); then
+  limit_kb=262144   # floor at 256 MB when a cap is requested
 fi
 
 run_with_limit() {
-  (
-    ulimit -Sv "${limit_kb}"
+  if ((vmem_pct > 0)); then
+    (
+      ulimit -Sv "${limit_kb}"
+      "$@"
+    )
+  else
     "$@"
-  )
+  fi
 }
 
 is_oom_failure() {

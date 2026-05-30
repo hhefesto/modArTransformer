@@ -1,21 +1,20 @@
--- Modular Arithmetic Transformer — Agda port
--- Backpropagation via Conal Elliott's categorical AD:
---   D (Dual AddFun) TransformerParams Float
--- No hand-written *Backward functions — gradients are derived from
--- the forward morphism via the chain rule in the D category.
+-- Modular Arithmetic Transformer — denotational rewrite.
 --
--- Reference: Elliott, "The Simple Essence of Automatic Differentiation" (2018)
-
+-- Meaning (Tai-Danae Bradley): the model denotes a [0,1]-enriched language
+--   category; ⟦θ⟧ ctx = softmax(logits) is a hom-object π(·|ctx).  See
+--   ModArTransformer.Semantics.* and .Meaning.
+-- Tooling (Conal Elliott): the forward pass is a morphism in D (Dual AddFun)
+--   built on felix; gradients are derived by the chain rule — no hand-written
+--   backward anywhere.  See ModArTransformer.Cat.* and .Layers.*.
 {-# OPTIONS --guardedness #-}
 module modArTransformer where
 
 open import Agda.Builtin.Float  using (Float; primNatToFloat; primShowFloat)
 open import Agda.Builtin.String using (String)
-open import Data.Nat            using (ℕ; zero; suc; _+_; _%_)
-open import Data.Fin            using (Fin; zero; suc; toℕ)
-open import Data.List           using (List; []; _∷_; length)
+open import Data.Nat            using (ℕ; zero; suc; _%_)
+open import Data.List           using (List; length)
 open import Data.Bool           using (Bool; true; false; if_then_else_)
-open import Data.Product        using (_×_; _,_)
+open import Data.Product        using (_×_; _,_; proj₁)
 open import Level using (0ℓ)
 open import Data.Unit.Polymorphic.Base using (⊤; tt)
 open import Data.Unit.Base            using () renaming (⊤ to Unit; tt to unit)
@@ -24,17 +23,19 @@ import IO.Primitive.Core as Prim
 open import Data.String         using (_++_)
 open import IO                  using (IO; Main; run; putStrLn; _>>_; _>>=_; pure)
 
-open import ModArTransformer.Tensor
+open import ModArTransformer.Tensor using (_f*_)
+open import ModArTransformer.Layers.Transformer using (TransformerParams)
+open import ModArTransformer.Cat.Adamable  using (AdamConfig; mkAdamCfg; AdamState; initAdam)
+open import ModArTransformer.Cat.Additive
+open import ModArTransformer.Cat.AdditiveTensor
+open import ModArTransformer.Cat.Serialize   -- opened fully so its instances resolve
 open import ModArTransformer.Random
-open import ModArTransformer.Layers.Transformer
-open import ModArTransformer.Optimizer.Adam
-open import ModArTransformer.Optimizer.Schedule
 open import ModArTransformer.Data
 open import ModArTransformer.Train
 open import ModArTransformer.Init
 open import ModArTransformer.Checkpoint
 
--- ─── Hyperparameters (matching Main.hs:1148-1167) ─────────────────────────────
+-- ─── Hyperparameters (Main.hs:1148-1167) ──────────────────────────────────────
 
 private
   p         : ℕ ; p         = 52   -- vocab = suc p = 53
@@ -54,6 +55,13 @@ private
 
   warmupSteps : ℕ ; warmupSteps = 2000
 
+-- The concrete parameter / optimizer types.
+Par : Set
+Par = TransformerParams p dModel dFF dK
+
+St : Set
+St = AdamState Par
+
 -- ─── File I/O via Haskell FFI ─────────────────────────────────────────────────
 
 {-# FOREIGN GHC
@@ -68,29 +76,23 @@ postulate
   primHFlushStdout  : Prim.IO Unit
 
 {-# FOREIGN GHC import qualified Data.Text as T #-}
-
 {-# COMPILE GHC primDoesFileExist = \p -> doesFileExist (T.unpack p) #-}
 {-# COMPILE GHC primReadFile      = \p -> fmap T.pack (readFile (T.unpack p)) #-}
 {-# COMPILE GHC primWriteFile     = \p s -> writeFile (T.unpack p) (T.unpack s) #-}
 {-# COMPILE GHC primHFlushStdout  = hFlush stdout #-}
 
 doesFileExistIO : String → IO Bool
-doesFileExistIO p = lift (primDoesFileExist p)
-
+doesFileExistIO q = lift (primDoesFileExist q)
 readFileIO : String → IO String
-readFileIO p = lift (primReadFile p)
-
+readFileIO q = lift (primReadFile q)
 writeFileIO : String → String → IO Unit
-writeFileIO p s = lift (primWriteFile p s)
-
+writeFileIO q s = lift (primWriteFile q s)
 flushStdoutIO : IO {0ℓ} ⊤
 flushStdoutIO = lift′ primHFlushStdout
 
-saveCheckpointIO : TransformerParams (suc p) dModel dFF dK → IO {0ℓ} ⊤
+saveCheckpointIO : Par → IO {0ℓ} ⊤
 saveCheckpointIO params = do
-  let floats = serializeParams (suc p) dModel dFF dK params
-      text   = floatsToString floats
-  _ ← writeFileIO "checkpoint.ckpt" text
+  _ ← writeFileIO "checkpoint.ckpt" (floatsToString (toFloats params))
   putStrLn "[checkpoint] saved checkpoint.ckpt"
   flushStdoutIO
 
@@ -98,71 +100,46 @@ saveCheckpointIO params = do
 
 showN : ℕ → String
 showN n = primShowFloat (primNatToFloat n)
-
 showF : Float → String
 showF = primShowFloat
-
 pct : Float → String
 pct f = showF (f f* 100.0) ++ "%"
-  where open import ModArTransformer.Tensor using (_f*_)
 
 -- ─── Training loop ────────────────────────────────────────────────────────────
 
-trainLoop : ℕ    -- remaining epochs
-          → ℕ    -- current epoch number (for logging and schedule)
-          → TransformerParams (suc p) dModel dFF dK
-          → AdamState p dModel dFF dK
-          → List (Example (suc p))
-          → List (Example (suc p))
-          → StdGen
-          → IO {0ℓ} ⊤
+trainLoop : ℕ → ℕ → Par → St
+          → List (Example (suc p)) → List (Example (suc p)) → StdGen → IO {0ℓ} ⊤
 trainLoop zero    _     _      _    _  _  _ = putStrLn "Done." >> pure tt
 trainLoop (suc e) epoch params adam tr te g =
   continue (trainEpoch epoch batchSize warmupSteps baseLR minLR cfg params adam tr g)
   where
-    open import Data.Nat using (_≡ᵇ_; _%_)
-
-    continue : TransformerParams (suc p) dModel dFF dK
-             × AdamState p dModel dFF dK
-             × Float × StdGen
-             → IO {0ℓ} ⊤
+    open import Data.Nat using (_≡ᵇ_)
+    continue : Par × St × Float × StdGen → IO {0ℓ} ⊤
     continue (params' , adam' , loss , g') =
       let lossLine = showN epoch ++ " | loss=" ++ showF loss
           evalLine = lossLine
                   ++ " | train=" ++ pct (accuracy params' tr)
                   ++ " | test="  ++ pct (accuracy params' te)
-      in
-      (if (epoch % 100) Data.Nat.≡ᵇ 0
-        then putStrLn evalLine
-        else putStrLn lossLine)
+      in (if (epoch % 100) Data.Nat.≡ᵇ 0 then putStrLn evalLine else putStrLn lossLine)
       >> flushStdoutIO
-      >> (if (epoch % checkpointEvery) Data.Nat.≡ᵇ 0
-          then saveCheckpointIO params'
-          else pure tt)
+      >> (if (epoch % checkpointEvery) Data.Nat.≡ᵇ 0 then saveCheckpointIO params' else pure tt)
       >> trainLoop e (suc epoch) params' adam' tr te g'
 
--- ─── Checkpoint loading helper with explicit types ────────────────────────────
+-- ─── Checkpoint loading ────────────────────────────────────────────────────────
 
-loadOrInit : Bool → StdGen
-           → IO {0ℓ} (TransformerParams (suc p) dModel dFF dK
-                     × AdamState p dModel dFF dK
-                     × ℕ × StdGen)
+loadOrInit : Bool → StdGen → IO {0ℓ} (Par × St × ℕ × StdGen)
 loadOrInit true g0 = do
   content ← readFileIO "checkpoint.ckpt"
-  let floats            = stringToFloats content
-      (params' , _)     = deserializeParams p dModel dFF dK floats
-      as0               = initAdamState {p} {dModel} {dFF} {dK} 0.9 0.999
+  let params' = proj₁ (fromFloats {Par} (stringToFloats content))
+      as0     = initAdam {Par} 0.9 0.999
   putStrLn "Loaded checkpoint.ckpt"
   pure (params' , as0 , 1 , g0)
 loadOrInit false g0 =
-  continue (initTransformer (suc p) dModel dFF dK seed0 g0)
+  continue (initTransformer p dModel dFF dK seed0 g0)
   where
-    continue : TransformerParams (suc p) dModel dFF dK × StdGen
-             → IO {0ℓ} (TransformerParams (suc p) dModel dFF dK
-                       × AdamState p dModel dFF dK
-                       × ℕ × StdGen)
+    continue : Par × StdGen → IO {0ℓ} (Par × St × ℕ × StdGen)
     continue (params' , g') = do
-      let as0 = initAdamState {p} {dModel} {dFF} {dK} 0.9 0.999
+      let as0 = initAdam {Par} 0.9 0.999
       putStrLn "Initialized fresh parameters"
       pure (params' , as0 , 1 , g')
 
@@ -170,13 +147,13 @@ loadOrInit false g0 =
 
 main : Main
 main = run (do
-  putStrLn "Modular Arithmetic Transformer — Agda port with Conal-style AD"
-  putStrLn "Backprop: D (Dual AddFun) TransformerParams Float"
+  putStrLn "Modular Arithmetic Transformer — denotational (Tai-Danae × Conal)"
+  putStrLn "Backprop: gradients derived in D (Dual AddFun) on felix"
   putStrLn "=========================================================="
 
-  let allData              = allExamples (suc p)
+  let allData                = allExamples (suc p)
       (trainData , testData) = splitData allData
-      g0                   = mkStdGenFromSeed seed0
+      g0                     = mkStdGenFromSeed seed0
 
   exists ← doesFileExistIO "checkpoint.ckpt"
   init-result ← loadOrInit exists g0

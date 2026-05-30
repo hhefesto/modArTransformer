@@ -3,9 +3,7 @@ module ModArTransformer.Data where
 
 open import Data.Nat     using (ℕ; suc; zero; _+_; _%_)
 open import Data.Fin     using (Fin; zero; suc; toℕ; fromℕ<)
-open import Data.Fin.Properties using (toℕ<n)
 open import Data.Nat.DivMod    using (m%n<n)
-open import Data.Nat.Properties using (s≤s; z≤n)
 open import Data.List    using (List; []; _∷_; _++_; map; length; foldl)
 open import Data.Product using (_×_; _,_)
 open import Data.Vec.Base as Vec using (Vec; []; _∷_; lookup; toList; fromList)

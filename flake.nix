@@ -1,46 +1,27 @@
 {
-  description = "Minimal transformer for modular arithmetic — Haskell + hmatrix, ported to Agda with Conal-style AD";
+  description = "Denotational transformer for modular arithmetic — Tai-Danae Bradley's [0,1]-enriched-category semantics as meaning, Conal Elliott's AD-as-categories (on felix) as gradient descent. Agda.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
-    haskell-flake.url = "github:srid/haskell-flake";
-    # PureScript tooling
-    purescript-overlay = {
-      url = "github:thomashoneyman/purescript-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
     # Conal Elliott's Agda category library
     felix = {
       url = "github:conal/felix";
       flake = false;
     };
-    flake-compat = {
-      url = "github:edolstra/flake-compat";
-      flake = false;
-    };
   };
 
-  outputs = inputs@{ self, nixpkgs, flake-compat, flake-parts, haskell-flake, ... }:
+  outputs = inputs@{ self, nixpkgs, flake-parts, ... }:
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
 
-      imports = [
-        inputs.haskell-flake.flakeModule
-      ];
-
-      perSystem = { self', config, system, ... }:
+      perSystem = { self', pkgs, system, ... }:
       let
-        pkgs = import inputs.nixpkgs {
-          inherit system;
-          overlays = [ inputs.purescript-overlay.overlays.default ];
-        };
-
         # ── Agda + stdlib + felix ────────────────────────────────────────────
         agdaWithStdlib = pkgs.agda.withPackages (p: [ p.standard-library ]);
 
-        # Pre-compile felix interfaces into a writable output path so agda
-        # never tries to write .agdai files into the read-only nix store.
+        # Pre-compile felix interfaces (.agdai next to source) so agda never
+        # re-type-checks felix nor writes into the read-only nix store.
         felixCompiled = pkgs.stdenv.mkDerivation {
           name = "felix-compiled";
           src = inputs.felix;
@@ -55,159 +36,136 @@
           installPhase = ":";
         };
 
-        # Wrap agda so every invocation gets -i <felix>/src automatically.
+        # Proxy importing the stdlib closure the project uses, so its interfaces
+        # get precompiled once.  (stdlib ships .agdai only under its _build/
+        # "library" layout, invisible to `-i <stdlib>/src` usage, which would
+        # otherwise re-type-check all of stdlib on every build.)
+        stdlibProxy = pkgs.writeText "ModArStdlibUses.agda" ''
+          {-# OPTIONS --guardedness #-}
+          module ModArStdlibUses where
+          import Agda.Builtin.Float
+          import Agda.Builtin.String
+          import Data.Bool
+          import Data.Char
+          import Data.Empty
+          import Data.Fin
+          import Data.Fin.Properties
+          import Data.List
+          import Data.Maybe
+          import Data.Nat
+          import Data.Nat.DivMod
+          import Data.Nat.Properties
+          import Data.Nat.Show
+          import Data.Product
+          import Data.String
+          import Data.Sum
+          import Data.Unit
+          import Data.Unit.Base
+          import Data.Unit.Polymorphic.Base
+          import Data.Vec.Base
+          import Function
+          import IO
+          import IO.Base
+          import IO.Primitive.Core
+          import Level
+          import Relation.Binary.PropositionalEquality
+        '';
+
+        # Precompile the stdlib closure to .agdai *next to source* (no .agda-lib
+        # in $out/src ⇒ next-to-source interface layout, matching how the project
+        # consumes it via `-i <stdlibCompiled>/src`).
+        stdlibCompiled = pkgs.stdenv.mkDerivation {
+          name = "agda-stdlib-compiled";
+          src = pkgs.agdaPackages.standard-library;
+          nativeBuildInputs = [ pkgs.agda pkgs.glibcLocales ];
+          LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
+          LC_ALL = "en_US.UTF-8";
+          buildPhase = ''
+            mkdir -p $out/src
+            cp -r src/. $out/src/
+            cp ${stdlibProxy} $out/src/ModArStdlibUses.agda
+            cd $out
+            agda -i src src/ModArStdlibUses.agda
+          '';
+          installPhase = ":";
+        };
+
+        # Wrap agda so every invocation reuses the precompiled stdlib + felix
+        # interfaces (fast local type-checks; no withPackages, to avoid a second
+        # stdlib on the search path).
         myAgda = pkgs.symlinkJoin {
-          name = "agda-with-felix";
-          paths = [ agdaWithStdlib ];
+          name = "agda-with-deps";
+          paths = [ pkgs.agda ];
           buildInputs = [ pkgs.makeWrapper ];
           postBuild = ''
             wrapProgram $out/bin/agda \
-              --add-flags "-i ${felixCompiled}/src"
+              --add-flags "-i ${stdlibCompiled}/src -i ${felixCompiled}/src"
           '';
         };
       in {
-        _module.args.pkgs = pkgs;
-        haskellProjects.default = {
-          basePackages = pkgs.haskellPackages;
-
-          settings = {
-            modArTransformer = {
-              custom = pkg: pkg.overrideAttrs (old: {
-                buildInputs = (old.buildInputs or []) ++ [
-                  pkgs.blas
-                  pkgs.lapack
-                ];
-              });
-            };
-          };
-
-          devShell = {
-            tools = hp: {
-              inherit (hp)
-                cabal-install
-                ghcid
-                haskell-language-server;
-            };
-            mkShellArgs = {
-              nativeBuildInputs = [
-                myAgda
-                pkgs.glibcLocales
-              ];
-              shellHook = ''
-                export LOCALE_ARCHIVE="${pkgs.glibcLocales}/lib/locale/locale-archive"
-                export LC_ALL="en_US.UTF-8"
-                echo "Agda ready with memory guard. Type-check with:"
-                echo "  ./scripts/agda-guard.sh agda modArTransformer.agda"
-                echo "Compile with:"
-                echo "  ./scripts/agda-guard.sh agda --compile modArTransformer.agda"
-              '';
-            };
-          };
-        };
-
-        packages.default = self'.packages.modArTransformer;
-
         # ── Agda packages ───────────────────────────────────────────────────
 
-        # Compile the full Agda port to a native executable via MAlonzo.
-        packages.agda-modArTransformer =
-          let stdlib = pkgs.agdaPackages.standard-library; in
-          pkgs.stdenv.mkDerivation {
-            name = "agda-modArTransformer";
-            src = pkgs.lib.cleanSource ./.;
-            nativeBuildInputs = [ pkgs.agda pkgs.ghc pkgs.glibcLocales ];
-            LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
-            LC_ALL = "en_US.UTF-8";
-            buildPhase = ''
-              cp -r ${inputs.felix}/src felix-src
-              chmod -R u+w felix-src
-              bash ./scripts/agda-guard.sh agda -i ${stdlib}/src -i felix-src --compile modArTransformer.agda
-            '';
-            installPhase = ''
-              mkdir -p $out/bin
-              cp modArTransformer $out/bin/agda-modArTransformer
-            '';
-          };
+        # Default build: compile the Agda project to a native executable (MAlonzo).
+        packages.default = self'.packages.agda-modArTransformer;
 
-        # Type-check only (fast CI gate, no GHC compilation step).
-        packages.agda-modArTransformer-check =
-          let stdlib = pkgs.agdaPackages.standard-library; in
-          pkgs.stdenv.mkDerivation {
-            name = "agda-modArTransformer-check";
-            src = pkgs.lib.cleanSource ./.;
-            nativeBuildInputs = [ pkgs.agda pkgs.glibcLocales ];
-            LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
-            LC_ALL = "en_US.UTF-8";
-            buildPhase = ''
-              cp -r ${inputs.felix}/src felix-src
-              chmod -R u+w felix-src
-              bash ./scripts/agda-guard.sh agda -i ${stdlib}/src -i felix-src modArTransformer.agda
-            '';
-            installPhase = ''
-              mkdir -p $out
-              echo "modArTransformer.agda type-checked" > $out/result
-            '';
-          };
+        packages.agda-modArTransformer = pkgs.stdenv.mkDerivation {
+          name = "agda-modArTransformer";
+          src = pkgs.lib.cleanSource ./.;
+          nativeBuildInputs = [ pkgs.agda pkgs.ghc pkgs.glibcLocales ];
+          LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
+          LC_ALL = "en_US.UTF-8";
+          # Reuse precompiled stdlib + felix interfaces (no re-type-checking of
+          # the libraries); no memory guard (ulimit -Sv throttles GHC).
+          buildPhase = ''
+            agda -i ${stdlibCompiled}/src -i ${felixCompiled}/src --compile modArTransformer.agda
+          '';
+          installPhase = ''
+            mkdir -p $out/bin
+            cp modArTransformer $out/bin/agda-modArTransformer
+          '';
+        };
+
+        # Type-check only (fast CI gate, no GHC codegen).
+        packages.agda-modArTransformer-check = pkgs.stdenv.mkDerivation {
+          name = "agda-modArTransformer-check";
+          src = pkgs.lib.cleanSource ./.;
+          nativeBuildInputs = [ pkgs.agda pkgs.glibcLocales ];
+          LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
+          LC_ALL = "en_US.UTF-8";
+          buildPhase = ''
+            agda -i ${stdlibCompiled}/src -i ${felixCompiled}/src modArTransformer.agda
+          '';
+          installPhase = ''
+            mkdir -p $out
+            echo "modArTransformer.agda type-checked" > $out/result
+          '';
+        };
 
         apps.default = {
           type = "app";
-          program = toString (pkgs.writeShellScript "run-agda-modArTransformer-guarded" ''
-            exec ${pkgs.bash}/bin/bash ${./scripts/agda-guard.sh} ${self'.packages.agda-modArTransformer}/bin/agda-modArTransformer "$@"
-          '');
+          program = "${self'.packages.agda-modArTransformer}/bin/agda-modArTransformer";
         };
+        apps.agda-modArTransformer = self'.apps.default;
 
-        apps.haskell = {
-          type = "app";
-          program = "${self'.packages.modArTransformer}/bin/modArTransformer";
-        };
-
-        apps.agda-modArTransformer = {
-          type = "app";
-          program = toString (pkgs.writeShellScript "run-agda-modArTransformer-guarded-app" ''
-            exec ${pkgs.bash}/bin/bash ${./scripts/agda-guard.sh} ${self'.packages.agda-modArTransformer}/bin/agda-modArTransformer "$@"
-          '');
-        };
-
-        packages.diagram = pkgs.runCommand "transformer-diagram" {} ''
-          mkdir -p $out
-          cp ${./purescript/index.html} $out/index.html
-          cp ${./purescript/index.js} $out/index.js
-        '';
-
-        apps.diagram = {
-          type = "app";
-          program = toString (pkgs.writeShellScript "run-diagram-purs" ''
-            echo "Starting server at http://localhost:8080"
-            ${pkgs.darkhttpd}/bin/darkhttpd ${self'.packages.diagram} --port 8080
-          '');
-        };
-
-        devShells.default = pkgs.lib.mkForce (pkgs.mkShell {
+        devShells.default = pkgs.mkShell {
           name = "modArTransformer-dev";
-          inputsFrom = [
-            config.haskellProjects.default.outputs.devShell
-          ];
-          nativeBuildInputs = with pkgs; [
-            blas
-            lapack
-            pkg-config
-            esbuild
-            python3
-            # PureScript (from purescript-overlay)
-            spago-unstable
-            purs-unstable
-            darkhttpd
-            # Agda
-            myAgda
-            glibcLocales
+          nativeBuildInputs = [
+            myAgda          # agda preloaded with stdlib + felix interfaces
+            pkgs.ghc        # for `agda --compile` (MAlonzo → GHC)
+            pkgs.glibcLocales
           ];
           shellHook = ''
             export LOCALE_ARCHIVE="${pkgs.glibcLocales}/lib/locale/locale-archive"
             export LC_ALL="en_US.UTF-8"
+            echo "Agda ready (stdlib + felix interfaces preloaded)."
+            echo "  Type-check: agda modArTransformer.agda"
+            echo "  Compile:    agda --compile modArTransformer.agda"
           '';
-        });
+        };
 
-        checks = self'.packages;
+        checks = {
+          inherit (self'.packages) agda-modArTransformer agda-modArTransformer-check;
+        };
       };
     };
 }

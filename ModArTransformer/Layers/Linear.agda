@@ -1,71 +1,34 @@
+-- A linear (affine) layer y = W·x + b, built *by composition* of the D
+-- primitives in Cat.VecPrim — no backward pass is written here.  Parameters are
+-- carried as a product (W , b) so that `Additive` (hence the gradient) is
+-- derived structurally; the gradient w.r.t. W, b and x all fall out of the
+-- chain rule in D (Dual AddFun).
 {-# OPTIONS --guardedness #-}
 module ModArTransformer.Layers.Linear where
 
-open import Agda.Builtin.Float using (Float)
-open import Data.Nat     using (ℕ)
-open import Data.Product using (_×_; _,_)
-open import ModArTransformer.Tensor
-open import ModArTransformer.Additive
-open import ModArTransformer.AD.AddFun
-open import ModArTransformer.AD.Dual
-open import ModArTransformer.AD.Core
+open import Data.Nat using (ℕ)
 
--- ─── Linear layer ─────────────────────────────────────────────────────────────
--- Params: weight W : ℝMat out inp, bias b : ℝVec out.
--- Forward: x → W #> x + b.
--- Differentiable w.r.t. ((W, b), x) jointly.
+open import ModArTransformer.Tensor using (ℝVec; ℝMat)
+open import ModArTransformer.Cat.Objects
+open import ModArTransformer.Cat.Additive
+open import ModArTransformer.Cat.D
+open import ModArTransformer.Cat.VecPrim
+open import ModArTransformer.Cat.AdditiveTensor
 
-record LinearParams (out inp : ℕ) : Set where
-  constructor mkLinear
-  field
-    linW : ℝMat out inp
-    linB : ℝVec out
+private variable m n : ℕ
 
-open LinearParams public
+-- Parameters of a linear layer: a weight matrix and a bias vector.
+LinParams : ℕ → ℕ → Set
+LinParams m n = ℝMat m n × ℝVec m
 
--- Zero-gradient linear params
-zeroLinear : {out inp : ℕ} → LinearParams out inp
-zeroLinear = mkLinear mzero vzero
-
-addLinear : {out inp : ℕ} → LinearParams out inp → LinearParams out inp → LinearParams out inp
-addLinear p q = mkLinear (linW p m+ linW q) (linB p v+ linB q)
-
-scaleLinear : {out inp : ℕ} → Float → LinearParams out inp → LinearParams out inp
-scaleLinear s p = mkLinear (mscale s (linW p)) (vscale s (linB p))
-
-instance
-  additiveLinear : {out inp : ℕ} → Additive (LinearParams out inp)
-  additiveLinear = record { zero = zeroLinear ; _⊕_ = addLinear }
-
--- ─── D (Dual AddFun) over (params × input) ────────────────────────────────────
--- The full differentiable linear layer: diff. w.r.t. both params and input.
--- Pullback decomposes: dY → (dW = outer dY x, dB = dY, dX = Wᵀ · dY)
--- Matching Main.hs:101-106.
-
-private
-  k = Dual AddFun
-
-linearLayerD : {out inp : ℕ}
-        → D k (LinearParams out inp × ℝVec inp) (ℝVec out)
-linearLayerD = mkD (λ (p , x) →
-  let y  = linW p #> x v+ linB p
-      pb dY =
-        let dW = outer dY x
-            dB = dY
-            dX = mtr (linW p) #> dY
-        in  (mkLinear dW dB , dX)
-  in  (y , mkDual (mkAddFun pb)))
-
--- Convenience: linear forward with only-params differentiation (input fixed).
-linearParamsD : {out inp : ℕ} → ℝVec inp → D k (LinearParams out inp) (ℝVec out)
-linearParamsD x = mkD (λ p →
-  let y  = linW p #> x v+ linB p
-      pb dY = mkLinear (outer dY x) dY
-  in  (y , mkDual (mkAddFun pb)))
-
--- Convenience: linear forward with only-input differentiation (params fixed).
-linearInputD : {out inp : ℕ} → LinearParams out inp → D k (ℝVec inp) (ℝVec out)
-linearInputD p = mkD (λ x →
-  let y      = linW p #> x v+ linB p
-      pb dY  = mtr (linW p) #> dY
-  in  (y , mkDual (mkAddFun pb)))
+-- The layer as a morphism  (params × input) ⇨ output  in the derivative
+-- category.  `eval` runs it forward; `gradient` differentiates it.
+linearLayerD : D (LinParams m n × ℝVec n) (ℝVec m)
+linearLayerD = vaddD ∘D ((matvecD ∘D (getW ▵D getx)) ▵D getb)
+  where
+    getW  : D (LinParams m n × ℝVec n) (ℝMat m n)
+    getW  = exlD ∘D exlD
+    getb  : D (LinParams m n × ℝVec n) (ℝVec m)
+    getb  = exrD ∘D exlD
+    getx  : D (LinParams m n × ℝVec n) (ℝVec n)
+    getx  = exrD

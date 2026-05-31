@@ -71,9 +71,8 @@ transformerLogits {p} {dModel} {dFF} {dK} tokA tokB = logits
     e1 = embedAt tokB (suc zero)
 
     -- 2. self-attention (+ residual on position 0)
-    attnOut : D Par (ℝVec dModel × ℝVec dModel)
-    attnOut = attnD ∘D (getAttn ▵D (e0 ▵D e1))
-    a0 = exlD ∘D attnOut
+    a0 : D Par (ℝVec dModel)
+    a0 = attn0D ∘D (getAttn ▵D (e0 ▵D e1))
     r10 : D Par (ℝVec dModel)
     r10 = vaddD ∘D (e0 ▵D a0)
 

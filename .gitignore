@@ -31,6 +31,8 @@ result-*
 *.agdai
 MAlonzo/
 modArTransformer-agda
+ERROR_LOG
+.#*
 
 # PureScript / Spago
 purescript/.purs-repl
@@ -39,4 +41,3 @@ purescript/.pulp-cache/
 purescript/.psc-package/
 purescript/.spago/
 purescript/output/
-

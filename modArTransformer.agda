@@ -111,7 +111,9 @@ trainLoop : ℕ → ℕ → Par → St
           → List (Example (suc p)) → List (Example (suc p)) → StdGen → IO {0ℓ} ⊤
 trainLoop zero    _     _      _    _  _  _ = putStrLn "Done." >> pure tt
 trainLoop (suc e) epoch params adam tr te g =
-  continue (trainEpoch epoch batchSize warmupSteps baseLR minLR cfg params adam tr g)
+  putStrLn ("[epoch] starting " ++ showN epoch)
+  >> flushStdoutIO
+  >> continue (trainEpoch epoch batchSize warmupSteps baseLR minLR cfg params adam tr g)
   where
     open import Data.Nat using (_≡ᵇ_)
     continue : Par × St × Float × StdGen → IO {0ℓ} ⊤

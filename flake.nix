@@ -102,6 +102,24 @@
               --add-flags "-i ${stdlibCompiled}/src -i ${felixCompiled}/src"
           '';
         };
+
+        projectSource = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            let
+              name = baseNameOf path;
+              rel = pkgs.lib.removePrefix ((toString ./.) + "/") (toString path);
+            in
+              pkgs.lib.cleanSourceFilter path type
+              && !(rel == "MAlonzo"
+                || pkgs.lib.hasPrefix "MAlonzo/" rel
+                || pkgs.lib.hasSuffix ".agdai" name
+                || name == "ERROR_LOG"
+                || name == ".#ERROR_LOG"
+                || name == "checkpoint.ckpt"
+                || name == "checkpoint.ckpt.bak"
+                || (rel == "modArTransformer" && type != "directory"));
+        };
       in {
         # ── Agda packages ───────────────────────────────────────────────────
 
@@ -110,7 +128,7 @@
 
         packages.agda-modArTransformer = pkgs.stdenv.mkDerivation {
           name = "agda-modArTransformer";
-          src = pkgs.lib.cleanSource ./.;
+          src = projectSource;
           nativeBuildInputs = [ pkgs.agda pkgs.ghc pkgs.glibcLocales ];
           LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
           LC_ALL = "en_US.UTF-8";
@@ -128,7 +146,7 @@
         # Type-check only (fast CI gate, no GHC codegen).
         packages.agda-modArTransformer-check = pkgs.stdenv.mkDerivation {
           name = "agda-modArTransformer-check";
-          src = pkgs.lib.cleanSource ./.;
+          src = projectSource;
           nativeBuildInputs = [ pkgs.agda pkgs.glibcLocales ];
           LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
           LC_ALL = "en_US.UTF-8";

@@ -25,9 +25,11 @@ open import IO                  using (IO; Main; run; putStrLn; _>>_; _>>=_; pur
 
 open import ModArTransformer.Tensor using (_f*_)
 open import ModArTransformer.Layers.Transformer using (TransformerParams)
-open import ModArTransformer.Cat.Adamable  using (AdamConfig; mkAdamCfg; AdamState; initAdam)
+open import ModArTransformer.Cat.Adamable
 open import ModArTransformer.Cat.Additive
 open import ModArTransformer.Cat.AdditiveTensor
+open import ModArTransformer.Cat.Scale
+open import ModArTransformer.Cat.Force
 open import ModArTransformer.Cat.Serialize   -- opened fully so its instances resolve
 open import ModArTransformer.Random
 open import ModArTransformer.Data

@@ -5,10 +5,11 @@
 module ModArTransformer.Cat.Force where
 
 open import Data.Nat using (ℕ)
-open import Data.Product using (_×_; proj₁; proj₂)
+open import Data.Product using (proj₁; proj₂)
 open import Data.Vec.Base using (map)
 
 open import ModArTransformer.Tensor
+open import ModArTransformer.Cat.Objects using (_×_)
 
 private variable A B : Set
 

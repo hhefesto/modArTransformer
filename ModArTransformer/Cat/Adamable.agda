@@ -9,10 +9,11 @@
 module ModArTransformer.Cat.Adamable where
 
 open import Data.Nat using (ℕ; suc)
-open import Data.Product using (_×_; _,_; proj₁; proj₂)
+open import Data.Product using (_,_; proj₁; proj₂)
 open import Data.Vec.Base using (map; zipWith)
 
 open import ModArTransformer.Tensor
+open import ModArTransformer.Cat.Objects using (_×_)
 open import ModArTransformer.Cat.Additive
 
 private variable A B : Set

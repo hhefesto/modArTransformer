@@ -7,9 +7,10 @@
 {-# OPTIONS --without-K #-}
 module ModArTransformer.Cat.Additive where
 
-open import Data.Product using (_×_; _,_; proj₁; proj₂)
+open import Data.Product using (_,_; proj₁; proj₂)
 open import Data.Unit using (⊤; tt)
 open import Agda.Builtin.Float using (Float; primFloatPlus)
+open import ModArTransformer.Cat.Objects using (_×_)
 
 private variable A B : Set
 

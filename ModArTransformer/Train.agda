@@ -72,46 +72,60 @@ exampleGradLoss params ex =
 -- ─── Batch step: accumulate grads, average, Adam update ───────────────────────
 
 private
-  batchAcc : Params p dModel dFF dK
+  batchAcc : ⦃ addP : Additive (Params p dModel dFF dK) ⦄
+           → ⦃ forceP : Forceable (Params p dModel dFF dK) ⦄
+           → Params p dModel dFF dK
            → Params p dModel dFF dK × Float → Example (suc p)
            → Params p dModel dFF dK × Float
-  batchAcc params acc ex =
+  batchAcc ⦃ addP ⦄ ⦃ forceP ⦄ params acc ex =
     let gl   = exampleGradLoss params ex
-        acc' = (proj₁ acc ⊕ proj₁ gl , proj₂ acc f+ proj₂ gl)
-    in  seqBy (force (proj₁ acc') f+ proj₂ acc') acc'
+        acc' = (Additive._⊕_ addP (proj₁ acc) (proj₁ gl) , proj₂ acc f+ proj₂ gl)
+    in  seqBy (Forceable.force forceP (proj₁ acc') f+ proj₂ acc') acc'
 
-trainBatch : Float → AdamConfig
+trainBatch : ⦃ addP : Additive (Params p dModel dFF dK) ⦄
+           → ⦃ scaleP : Scale (Params p dModel dFF dK) ⦄
+           → ⦃ adamP : Adamable (Params p dModel dFF dK) ⦄
+           → ⦃ forceP : Forceable (Params p dModel dFF dK) ⦄
+           → Float → AdamConfig
            → Params p dModel dFF dK → AdamState (Params p dModel dFF dK)
            → List (Example (suc p))
            → Params p dModel dFF dK × AdamState (Params p dModel dFF dK) × Float
 trainBatch _  _   params adam [] = (params , adam , 0.0)
-trainBatch lr cfg params adam batch =
-  let (gSum , lSum) = foldl' (batchAcc params) (zeroA , 0.0) batch
+trainBatch ⦃ addP ⦄ ⦃ scaleP ⦄ ⦃ adamP ⦄ ⦃ forceP ⦄ lr cfg params adam batch =
+  let (gSum , lSum) = foldl' (batchAcc ⦃ addP ⦄ ⦃ forceP ⦄ params) (Additive.zeroA addP , 0.0) batch
       n        = primNatToFloat (length batch)
-      gAvg     = scaleA (1.0 f/ n) gSum
-      (params' , adam') = adamStep lr cfg params gAvg adam
-  in  seqBy (force params') (params' , adam' , lSum f/ n)
+      gAvg     = Scale.scaleA scaleP (1.0 f/ n) gSum
+      (params' , adam') = adamStep ⦃ adamP ⦄ lr cfg params gAvg adam
+  in  seqBy (Forceable.force forceP params') (params' , adam' , lSum f/ n)
 
 -- ─── One epoch: shuffle, chunk, fold batches ──────────────────────────────────
 
 private
-  epochAcc : Float → AdamConfig
+  epochAcc : ⦃ addP : Additive (Params p dModel dFF dK) ⦄
+           → ⦃ scaleP : Scale (Params p dModel dFF dK) ⦄
+           → ⦃ adamP : Adamable (Params p dModel dFF dK) ⦄
+           → ⦃ forceP : Forceable (Params p dModel dFF dK) ⦄
+           → Float → AdamConfig
            → Params p dModel dFF dK × AdamState (Params p dModel dFF dK) × Float
            → List (Example (suc p))
            → Params p dModel dFF dK × AdamState (Params p dModel dFF dK) × Float
-  epochAcc lr cfg (params , adam , lacc) batch =
-    let (params' , adam' , bl) = trainBatch lr cfg params adam batch
-    in  seqBy (force params') (params' , adam' , lacc f+ bl)
+  epochAcc ⦃ addP ⦄ ⦃ scaleP ⦄ ⦃ adamP ⦄ ⦃ forceP ⦄ lr cfg (params , adam , lacc) batch =
+    let (params' , adam' , bl) = trainBatch ⦃ addP ⦄ ⦃ scaleP ⦄ ⦃ adamP ⦄ ⦃ forceP ⦄ lr cfg params adam batch
+    in  seqBy (Forceable.force forceP params') (params' , adam' , lacc f+ bl)
 
-trainEpoch : ℕ → ℕ → ℕ → Float → Float → AdamConfig
+trainEpoch : ⦃ addP : Additive (Params p dModel dFF dK) ⦄
+           → ⦃ scaleP : Scale (Params p dModel dFF dK) ⦄
+           → ⦃ adamP : Adamable (Params p dModel dFF dK) ⦄
+           → ⦃ forceP : Forceable (Params p dModel dFF dK) ⦄
+           → ℕ → ℕ → ℕ → Float → Float → AdamConfig
            → Params p dModel dFF dK → AdamState (Params p dModel dFF dK)
            → List (Example (suc p)) → StdGen
            → Params p dModel dFF dK × AdamState (Params p dModel dFF dK) × Float × StdGen
-trainEpoch epoch bsz warmup baseLR minLR cfg params adam trainData g0 =
+trainEpoch ⦃ addP ⦄ ⦃ scaleP ⦄ ⦃ adamP ⦄ ⦃ forceP ⦄ epoch bsz warmup baseLR minLR cfg params adam trainData g0 =
   let (shuffled , g1) = shuffleList trainData g0
       batches  = chunksOf bsz shuffled
       lr       = lrWarmupCosine epoch warmup baseLR minLR 500000
       (params' , adam' , lossSum) =
-        foldl' (epochAcc lr cfg) (params , adam , 0.0) batches
+        foldl' (epochAcc ⦃ addP ⦄ ⦃ scaleP ⦄ ⦃ adamP ⦄ ⦃ forceP ⦄ lr cfg) (params , adam , 0.0) batches
       nB = length batches
   in  (params' , adam' , (if natEq nB 0 then 0.0 else lossSum f/ primNatToFloat nB) , g1)

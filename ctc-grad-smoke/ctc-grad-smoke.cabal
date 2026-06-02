@@ -14,9 +14,8 @@ executable ctc-grad-smoke
                   , ghc-prim
   ghc-options:      -O2 -threaded -rtsopts
                     -fplugin=ConCat.Plugin
-                    -fsimpl-tick-factor=10000
-                    -funfolding-case-threshold=1
-                    -funfolding-case-scaling=5
+                    -fexpose-all-unfoldings
+                    -fsimpl-tick-factor=2000
                     -freduction-depth=0
   default-language: Haskell2010
   default-extensions:

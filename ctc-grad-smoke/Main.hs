@@ -1,12 +1,24 @@
+{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
+
 module Main where
 
-import ConCat.AD (gradient)
+-- Reverse-mode gradient via ConCat.RAD = GD (Dual (-+>)) (Dual AdditiveFun),
+-- the path ConCat's own tests use (andGradR/andGrad2R).  This avoids the
+-- LinearRow `L s` row-matrix representation that ConCat.AD.gradient uses, whose
+-- free-vector-space Pointed instances ($fPointed:*:/$fPointedPar1) made the GHC
+-- simplifier loop.  gradR only needs `Num s`.
+import ConCat.RAD (gradR)
 import ConCat.Rebox ()
 
--- This currently documents the heavier CTC-gradient acceptance gate.  The main
--- ctc-smoke package stays as the green Stage 0-2 forward/numeric-kernel gate.
+-- grad (x^2 + y^2) = (2x, 2y); at (3,4) -> (6,8).
 ctcGrad :: (Double, Double) -> (Double, Double)
-ctcGrad = gradient (\(x, y) -> x * x + y * y)
+ctcGrad = gradR (\(x, y) -> x * x + y * y)
 
 main :: IO ()
 main = do

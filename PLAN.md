@@ -112,10 +112,14 @@ blocker.
   NLL, sigmoid MLP, attention readout, residual add, layer norm via `sqrt`, FFN-style logits, and loss
   all elaborate through `toCcc` at the current pin.
 - The anticipated `Double#` panic has not occurred in the forward/loss path.
-- CTC-gradient is still blocked: even `ConCat.AD.gradient (\(x, y) -> x*x + y*y)` exhausts GHC
-  simplifier ticks under ghc948 despite loop-breaking flags and a high simplifier tick factor.
-- Therefore keep escalating `ctc-smoke` for forward/loss fragments, keep `ctc-grad-smoke` package/app
-  only, and do not add gradient CTC to checks until the simplifier loop is solved.
+- CTC-gradient is now CRACKED: `ConCat.AD.gradient` looped because it uses `GD (L s)` (LinearRow
+  row-matrix maps → `$fPointed:*:` loop). Switching to **`ConCat.RAD.gradR`** (reverse-mode
+  `GD (Dual (-+>))`, only `Num s`, the path ConCat's own tests use) compiles cleanly:
+  `gradR (\(x,y)->x*x+y*y) (3,4) = (6.0,8.0)`. Dropped the loop-breaker flags, added
+  `-fexpose-all-unfoldings`, `-fsimpl-tick-factor=2000 -freduction-depth=0`. `ctc-grad-smoke` is
+  now a green flake check.
+- Next: build a `params -> loss` whose gradient is `gradR (toCcc loss)`, add weight decay → grok;
+  then a parallel-category interpretation for speed.
 
 ## Gradient Blocker Implications
 

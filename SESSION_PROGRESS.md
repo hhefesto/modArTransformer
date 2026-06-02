@@ -47,25 +47,30 @@ All of these pass through Conal's Compile-to-Categories plugin via `toCcc`:
   transformer fragment and eventually a `toCcc`-able `forwardT`.
 - This does not yet make full categorical-gradient training via CTC viable.
 
-## `ConCat.AD.gradient` Trouble
+## `ConCat.AD.gradient` Trouble — RESOLVED (use `ConCat.RAD.gradR`)
 
-The isolated gradient smoke is deliberately small:
+The isolated gradient smoke was:
 
 ```haskell
 ConCat.AD.gradient (\(x, y) -> x * x + y * y)
 ```
 
-Even this exhausts GHC simplifier ticks under the current `ghc948`/`concat` setup. Attempts with
-loop-breaking flags still fail:
+which exhausted GHC simplifier ticks under `ghc948`/`concat`, looping on `$fPointed:*:` /
+`$fPointedPar1` (~1.86M ticks) regardless of tick factor or loop-breaker flags.
 
-- `-funfolding-case-threshold=1`
-- `-funfolding-case-scaling=5`
-- `-freduction-depth=0`
-- `-fsimpl-tick-factor=10000`
+Root cause (representation-specific): `ConCat.AD.gradient` uses `D s = GD (L s)` — `LinearRow`
+row-matrix linear maps — which pull in the free-vector-space `Pointed` instances that loop.
 
-The observed failure remains around dictionary/instance simplification such as `$fPointed:*:` with
-very high simplifier tick counts. The important distinction is that this is gradient-specific. The
-ordinary forward/loss `toCcc` path is green through Stage 8.
+Fix: compute the gradient through **`ConCat.RAD.gradR`** — reverse-mode AD via
+`RAD = GD (Dual (-+>))` (`Dual AdditiveFun`), the path ConCat's own `BasicTests` uses
+(`andGradR`/`andGrad2R`), constrained only by `Num s`, with no `L s`/`Pointed` machinery. Also
+dropped the loop-breakers (`-funfolding-case-threshold=1`, `-funfolding-case-scaling=5`) and added
+`-fexpose-all-unfoldings`; `-fsimpl-tick-factor=2000 -freduction-depth=0` suffice.
+
+Result: `ctc-grad-smoke` compiles and `gradR (\(x,y)->x*x+y*y) (3,4) = (6.0,8.0)`. It is now a
+green flake check (`checks.x86_64-linux.ctc-grad-smoke`). CTC gradients flow through `toCcc` with
+no hand-written backward — the Conal way. The forward/loss `toCcc` path remains green through
+Stage 8.
 
 ## Implications Of The Gradient Blocker
 

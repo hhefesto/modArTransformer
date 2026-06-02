@@ -253,7 +253,7 @@
         };
 
         checks = {
-          inherit (self'.packages) agda-modArTransformer agda-modArTransformer-check agda-modArTensorDiagnostics modartransformer-backend ctc-smoke;
+          inherit (self'.packages) agda-modArTransformer agda-modArTransformer-check agda-modArTensorDiagnostics modartransformer-backend ctc-smoke ctc-grad-smoke;
         };
       };
     };

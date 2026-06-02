@@ -18,8 +18,9 @@ Plan file: `~/.claude/plans/read-opencode-s-latest-plan-quizzical-valley.md`
 - [~] Phase 4 — Verification ladder (grad check ✓, p=5 overfit ✓, p=53 timing ~, grokking pending)
 - [~] Phase 5 — CTC compilation (acceptance gate): plugin DE-RISKED via ctc-smoke
       (Bool/scalar/dot/matvec/softmax/NLL/tiny-MLP-NLL/tiny-attention/tiny-block-NLL all
-      elaborate, no Double# panic); next: larger shape-fixed block fragments → toCcc-able forwardT
-      + parallel category
+      elaborate, no Double# panic); GRADIENT via toCcc now CRACKED via ConCat.RAD.gradR
+      (reverse-mode Dual AdditiveFun) — `gradR (x²+y²) -> (6,8)`, now a flake check.
+      Next: `params -> loss` gradient via gradR → weight-decay grokking → parallel category
 - [ ] Phase 6 — Agda conformance oracle
 
 ## Decisions (from planning session)
@@ -139,11 +140,26 @@ arithmetic with only `-fplugin=ConCat.Plugin` (no extra reboxing flags needed). 
 the largest schedule risk; the literal `toCcc` path is open for larger transformer block fragments →
 full forwardT.
 
-Stage 3 gradient smoke is intentionally isolated in `ctc-grad-smoke/` and not included in flake
-checks. `ConCat.AD.gradient (\(x,y) -> x*x + y*y)` still exhausts GHC simplifier ticks under ghc948,
-even with `-funfolding-case-threshold=1`, `-funfolding-case-scaling=5`, `-freduction-depth=0`, and
-`-fsimpl-tick-factor=10000` (`$fPointed:*:`, total ticks 1864001). This is a gradient-specific CTC
-blocker, not a regression of the green forward/loss path.
+### CTC GRADIENT — CRACKED ★ (gradient via toCcc now compiles + is a flake check)
+The gradient blocker is resolved. Root cause was **representation-specific**: `ConCat.AD.gradient`
+uses `D s = GD (L s)` — `LinearRow` row-matrix linear maps — which drag in the free-vector-space
+`V`/`Par1`/`:*:` `Pointed` instances, making the GHC simplifier loop on `$fPointed:*:`/`$fPointedPar1`
+(~1.86M ticks, never converging) regardless of tick factor or loop-breaker flags.
+
+Fix (in `ctc-grad-smoke/`): compute the gradient through **`ConCat.RAD.gradR`** — reverse-mode AD
+via `RAD = GD (Dual (-+>))` (`Dual AdditiveFun`), the path ConCat's own `BasicTests` uses
+(`andGradR`/`andGrad2R`). It is constrained only by `Num s` and never touches the `L s` row-matrix
+`Pointed` machinery. Also dropped the counterproductive loop-breakers
+(`-funfolding-case-threshold=1`, `-funfolding-case-scaling=5`) and added `-fexpose-all-unfoldings`
+(ConCat's documented requirement); `-fsimpl-tick-factor=2000 -freduction-depth=0` suffice.
+
+Result: `gradR (\(x,y) -> x*x + y*y)` compiles cleanly and `(3,4) -> (6.0,8.0)` (exact). Reproduce:
+`nix build .#ctc-grad-smoke && nix run .#ctc-grad-smoke`. Now a flake check
+(`checks.x86_64-linux.ctc-grad-smoke`, green). Source: `ctc-grad-smoke/Main.hs`.
+
+Significance: this is the gate for CTC *training* — gradients now flow through `toCcc`, no
+hand-written backward, the Conal way. Next: a `params -> loss` function whose gradient is
+`gradR (toCcc loss)`, weight decay → grokking; then a parallel-category interpretation for speed.
 
 ---
 

@@ -61,5 +61,6 @@ executable backend-transformer-train
                   , directory
                   , vector
                   , deepseq
+                  , time
   ghc-options:      -O2 -threaded -rtsopts "-with-rtsopts=-N -A64m -I0"
   default-language: Haskell2010

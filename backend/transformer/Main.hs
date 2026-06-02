@@ -15,6 +15,7 @@ import Data.List (foldl')
 import System.Environment (getArgs)
 import System.Directory (doesFileExist)
 import System.IO (hFlush, stdout)
+import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import Text.Printf (printf)
 import System.Random (StdGen, mkStdGen, randomR)
 import GHC.TypeNats (KnownNat, natVal)
@@ -123,13 +124,14 @@ data Cfg = Cfg
   , cMaxRun   :: Int      -- max epochs to run THIS invocation
   , cCkpt     :: FilePath
   , cWD       :: Double   -- AdamW weight decay (matrices only)
+  , cSeed     :: Int      -- RNG seed: data split + Xavier init + per-epoch shuffle
   }
 
 train :: forall v dM dF dK. (ParamsC v dM dF dK, Adam (Params v dM dF dK), Serialize (Params v dM dF dK))
       => Cfg -> Proxy '(v, dM, dF, dK) -> IO ()
 train cfg _ = do
   let p   = cP cfg
-      g0  = mkStdGen 42
+      g0  = mkStdGen (cSeed cfg)
       adamCfg = AdamConfig 0.9 0.999 1.0e-8 (cWD cfg)
       allData = generateData p
       (tr0, te0, _) = splitData (cFrac cfg) g0 allData
@@ -149,12 +151,66 @@ train cfg _ = do
           ps = fst (fromFloats flat) :: Params v dM dF dK
       printf "Fresh init (Xavier).\n"
       pure (ps, initAdam, 1)
-  printf "p=%d dM=%d dF=%d dK=%d | train=%d test=%d batches/epoch=%d totalSteps=%d\n"
-    p dMI dFI dKI (length tr0) (length te0) batchesPer totalSteps
+  -- ── detailed run header: what is being trained, how, and why it matters ──────
+  let p2     = p * p
+      nParam = length (toFloats params0)
+      chance = 100 / fromIntegral p :: Double
+  printf "════════════════════════════════════════════════════════════════════════\n"
+  printf " Modular-arithmetic GROKKING — categorical (Conal-AD) transformer\n"
+  printf "════════════════════════════════════════════════════════════════════════\n"
+  printf " Task : learn (a + b) mod %d.  Two input tokens a,b in {0..%d} -> the model\n" p (p - 1)
+  printf "        must output the residue (a+b) mod %d.  All %d ordered pairs are\n" p p2
+  printf "        split %.0f%%/%.0f%% train/test, so it trains on only %d of %d facts and\n"
+         (cFrac cfg * 100) (100 - cFrac cfg * 100) (length tr0) p2
+  printf "        must GENERALIZE the rule to the %d pairs it never sees.\n" (length te0)
+  printf " Why  : \"grokking\" — delayed generalization (Power et al. 2022, modulus p=97).\n"
+  printf "        Train acc -> ~100%% within a few hundred epochs (memorization) while\n"
+  printf "        test acc stays near chance (~%.1f%%) far longer, then jumps sharply once\n" chance
+  printf "        weight decay drives the net onto a generalizing circuit.  Watch test%%.\n"
+  printf " Model: 1-layer single-head transformer, seqLen=2, readout at position 0.\n"
+  printf "        dModel=%d  dFF=%d  dK=%d  vocab=%d  |  %d parameters.\n" dMI dFI dKI p nParam
+  printf " AD   : gradient = ONE reverse pass of Conal Elliott's AD-as-categories\n"
+  printf "        (Wengert tape, Tape.hs); no hand-written backward.  Loss = cross-\n"
+  printf "        entropy (softmax as a [0,1]-enriched copresheaf; relative entropy to\n"
+  printf "        the Dirac truth — Tai-Danae Bradley).\n"
+  printf " Optim: AdamW (b1=0.9 b2=0.999 eps=1e-8), decoupled weight decay wd=%g on\n" (cWD cfg)
+  printf "        MATRICES ONLY — the grokking lever (higher wd groks sooner).  LR:\n"
+  printf "        warmup %d steps -> ~flat %g (cosine over %d steps).  batch=%d;\n"
+         (cWarmup cfg) (cBaseLR cfg) totalSteps (cBatch cfg)
+  printf "        1 step = 1 batch gradient update (the axis the paper reports).\n"
+  printf " Run  : seed=%d (deterministic per seed); checkpoint %s every %d epochs\n"
+         (cSeed cfg) (cCkpt cfg) (cCkptEv cfg)
+  printf "        (params+Adam+step+epoch, auto-resumes); eval every %d epochs.\n" (cEvalEv cfg)
+  printf "────────────────────────────────────────────────────────────────────────\n"
+  printf " Legend — banner fields:\n"
+  printf "   p             modulus = vocab size; tokens are residues 0..p-1, task (a+b) mod p\n"
+  printf "   dM            dModel: width of the residual stream / token-embedding vectors\n"
+  printf "   dF            dFF: hidden width of the feed-forward (MLP) block\n"
+  printf "   dK            attention query/key/value dimension (single head)\n"
+  printf "   train/test    counts of training / held-out example pairs (sum = p*p)\n"
+  printf "   batches/epoch minibatches per epoch = ceil(train / batch)\n"
+  printf "   totalSteps    LR-schedule horizon (schedEpochs*batches/epoch); cosine denominator,\n"
+  printf "                 set huge so lr stays ~flat\n"
+  printf "   seed          RNG seed for split + init + shuffle (run is deterministic per seed)\n"
+  printf " Legend — per-epoch columns:\n"
+  printf "   epoch         one full pass over the training set\n"
+  printf "   step          cumulative optimizer steps = batch gradient updates (the paper's x-axis)\n"
+  printf "   lr            current learning rate (warmup -> ~flat cosine)\n"
+  printf "   loss          mean cross-entropy over the epoch's batches (nats)\n"
+  printf "   train%%        accuracy on the training set (argmax logit == target)\n"
+  printf "   test%%         accuracy on the held-out set — the grokking signal to watch\n"
+  printf "   elapsed       wall-clock seconds since this invocation started\n"
+  printf "════════════════════════════════════════════════════════════════════════\n"
+  printf "p=%d dM=%d dF=%d dK=%d | train=%d test=%d batches/epoch=%d totalSteps=%d seed=%d\n"
+    p dMI dFI dKI (length tr0) (length te0) batchesPer totalSteps (cSeed cfg)
+  -- column header for the per-epoch eval rows that follow
+  printf "%7s | %9s | %8s | %8s | %7s | %7s | %8s\n"
+    "epoch" "step" "lr" "loss" "train%" "test%" "elapsed"
   hFlush stdout
+  t0 <- getCurrentTime
 
   let lastEpoch = startEpoch + cMaxRun cfg - 1
-      gE = mkStdGen (1000 + startEpoch)
+      gE = mkStdGen (cSeed cfg + 1000 + startEpoch)
 
       loop !epoch !ps !st !g
         | epoch > lastEpoch = do
@@ -180,8 +236,10 @@ train cfg _ = do
                 let tr = accuracy ps' tr0
                     te = accuracy ps' te0
                     lrNow = lrWarmupCosine (cWarmup cfg) totalSteps (cBaseLR cfg) (cMinLR cfg) (asT st')
-                printf "%6d | step=%8d | lr=%.6f | loss=%.4f | train=%.1f%% | test=%.1f%%\n"
-                  epoch (asT st') lrNow avgLoss (tr * 100) (te * 100)
+                now <- getCurrentTime
+                let elapsed = realToFrac (diffUTCTime now t0) :: Double
+                printf "%7d | %9d | %8.6f | %8.4f | %7.1f | %7.1f | %7.1fs\n"
+                  epoch (asT st') lrNow avgLoss (tr * 100) (te * 100) elapsed
                 hFlush stdout
               else pure ()
             if epoch `mod` cCkptEv cfg == 0
@@ -193,24 +251,38 @@ train cfg _ = do
 
 -- ── entry ───────────────────────────────────────────────────────────────────────
 
+-- Usage: backend-transformer-train [MODE] [MAX_EPOCHS] [SEED]
+--   MODE       p5 | p53 | p53hi | p97 | p97hi   (default p53)
+--   MAX_EPOCHS epochs to run THIS invocation (resumes from checkpoint)
+--   SEED       RNG seed for split/init/shuffle (default 42; vary for non-identical runs)
 main :: IO ()
 main = do
   args <- getArgs
-  case args of
-    ("p5" : rest) ->
-      let n = readDef 2000 rest
-      in train (Cfg 5 1.0 25 5000 200 1.0e-3 1.0e-5 50 500 n "checkpoint-p5.ckpt" 1.0e-3)
-               (Proxy @'(5, 16, 64, 16))
+  let (mode, rest) = case args of (m : r) -> (m, r); [] -> ("p53", [])
+      seed = readArg 1 42 rest
+  case mode of
+    "p5" ->
+      train (Cfg 5 1.0 25 5000 200 1.0e-3 1.0e-5 50 500 (readArg 0 2000 rest) "checkpoint-p5.ckpt" 1.0e-3 seed)
+            (Proxy @'(5, 16, 64, 16))
     -- accelerated grokking probe: identical to the canonical run but with 10× weight
     -- decay (the established lever that brings grokking onset earlier).  Flat lr
     -- (cosine over 500000 epochs ≈ constant 1e-3) so the transition isn't starved.
-    ("p53hi" : rest) ->
-      let n = readDef 1000 rest
-      in train (Cfg 53 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 n "checkpoint-p53hi.ckpt" 1.0e-2)
-               (Proxy @'(53, 64, 256, 64))
-    rest ->
-      let n = readDef 1000 rest
-      in train (Cfg 53 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 n "checkpoint-p53.ckpt" 1.0e-3)
-               (Proxy @'(53, 64, 256, 64))
-  where readDef d xs = case xs of (x : _) -> maybe d id (readMaybeInt x); _ -> d
+    "p53hi" ->
+      train (Cfg 53 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p53hi.ckpt" 1.0e-2 seed)
+            (Proxy @'(53, 64, 256, 64))
+    -- p=97 (the grokking paper's modulus) on our 1-layer/single-head architecture;
+    -- ~147 batches/epoch, so slower per epoch than p53.  "p97hi" is the accelerated
+    -- recipe (wd=1e-2, the lever that brings grokking onset earlier — use this to
+    -- grok); plain "p97" is the canonical wd=1e-3.
+    "p97hi" ->
+      train (Cfg 97 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p97hi.ckpt" 1.0e-2 seed)
+            (Proxy @'(97, 64, 256, 64))
+    "p97" ->
+      train (Cfg 97 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p97.ckpt" 1.0e-3 seed)
+            (Proxy @'(97, 64, 256, 64))
+    -- default / "p53": canonical run, faithful hyperparameters (wd=1e-3).
+    _ ->
+      train (Cfg 53 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p53.ckpt" 1.0e-3 seed)
+            (Proxy @'(53, 64, 256, 64))
+  where readArg i d xs = case drop i xs of (x : _) -> maybe d id (readMaybeInt x); _ -> d
         readMaybeInt s = case reads s of [(x, "")] -> Just x; _ -> Nothing

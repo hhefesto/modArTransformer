@@ -11,7 +11,7 @@ executable ctc-smoke
                   , concat-classes
                   , concat-plugin
                   , ghc-prim
-  ghc-options:      -O2 -Wall -threaded -rtsopts
+  ghc-options:      -O2 -threaded -rtsopts
                     -fplugin=ConCat.Plugin
   default-language: Haskell2010
   default-extensions:

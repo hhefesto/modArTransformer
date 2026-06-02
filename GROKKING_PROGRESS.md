@@ -16,8 +16,10 @@ Plan file: `~/.claude/plans/read-opencode-s-latest-plan-quizzical-valley.md`
 - [x] Phase 2 — Fast Cont/Dual transformer forward pass (hmatrix-backed)
 - [x] Phase 3 — AdamW + per-step schedule + full checkpoint (from recovered Main.hs)
 - [~] Phase 4 — Verification ladder (grad check ✓, p=5 overfit ✓, p=53 timing ~, grokking pending)
-- [~] Phase 5 — CTC compilation (acceptance gate): plugin DE-RISKED via ctc-smoke (Bool/scalar/dot
-      all elaborate, no Double# panic); next: matvec → toCcc-able forwardT + parallel category
+- [~] Phase 5 — CTC compilation (acceptance gate): plugin DE-RISKED via ctc-smoke
+      (Bool/scalar/dot/matvec/softmax/NLL/tiny-MLP-NLL/tiny-attention/tiny-block-NLL all
+      elaborate, no Double# panic); next: larger shape-fixed block fragments → toCcc-able forwardT
+      + parallel category
 - [ ] Phase 6 — Agda conformance oracle
 
 ## Decisions (from planning session)
@@ -107,22 +109,41 @@ historically. The wd=1e-3 vs wd=1e-2 contrast cleanly shows weight decay as the 
 (consistent with the historical note "99% test required wd=1e-3").
 
 ### Remaining plan items (not part of the grokking goal; for when you're back)
-- Phase 5: CTC acceptance gate — route the forward pass through `toCcc`. Plugin DE-RISKED (see
-  below); next is a parallel-category interpretation and/or a `toCcc`-able categorical forwardT.
+- Phase 5: CTC acceptance gate — route the forward pass through `toCcc`. Plugin DE-RISKED through
+  fixed linear, softmax, NLL, tiny MLP-loss, tiny attention, and tiny block-loss fragments (see
+  below); next is larger transformer block fragments, then a parallel-category interpretation and/or a `toCcc`-able
+  categorical forwardT.
 - Phase 6: Agda conformance oracle — diff MAlonzo-evaluated Agda logits/loss against the backend.
 - Optional: let the canonical wd=1e-3 run continue toward the exact historical ~66k-epoch grokking.
 
 ### Phase 5 — CTC plugin de-risk: VIABLE (no Double# panic) ★
 Staged `ctc-smoke` escalation through Conal's `concat` plugin (`toCcc`), all PASSING:
-- Stage 0 — Bool projection `\(x,_)->x`            → ctc=True (structural elaboration works)
-- Stage 1 — scalar Double `\(x,y)->x*y+1`          → ctc=13.0 (NumCat/FloatingCat works)
+- Stage 0 — Bool projection `\(x,_)->x` → ctc=True (structural elaboration works)
+- Stage 1 — scalar Double `\(x,y)->x*y+1` → ctc=13.0 (NumCat/FloatingCat works)
 - Stage 2 — numeric kernel `\((a,b),(c,d))->a*c+b*d` → ctc=11.0 (mul+add over Doubles works)
+- Stage 3 — fixed 2x2 matvec → ctc=(17.0,39.0) (small linear kernel works)
+- Stage 4 — two-class softmax → matches direct Haskell to 1e-12 (`exp` and division work)
+- Stage 5 — class-0 NLL → matches direct Haskell to 1e-12 (`log` and `negate` work)
+- Stage 6 — fixed tiny MLP NLL → ctc=0.34622423561117693 (affine → sigmoid → affine → NLL works)
+- Stage 7 — fixed two-key attention readout → ctc=(0.7123283038410656,-0.8493132153642624)
+  (dot scores → softmax → value mix works)
+- Stage 8 — fixed mini transformer-block NLL → ctc=0.4669857292892942
+  (attention → residual → layernorm/sqrt → FFN logits → NLL works)
 
 Verdict: **the anticipated `Double#` panic does NOT occur** at the current pin — `concat` from
 the flake input (overlaid on **ghc948**, `dontCheck concat-plugin`, `flake.nix:127-141`) elaborates
-scalar and dot-product `Double` arithmetic with only `-fplugin=ConCat.Plugin` (no extra reboxing
-flags needed). Reproduce: `nix build .#ctc-smoke && nix run .#ctc-smoke`. Source: `ctc-smoke/Main.hs`.
-This clears the largest schedule risk; the literal `toCcc` path is open for matvec → full forwardT.
+scalar, linear-kernel, softmax, NLL, tiny MLP-loss, tiny attention, and tiny block-loss `Double`
+arithmetic with only `-fplugin=ConCat.Plugin` (no extra reboxing flags needed). Reproduce:
+`nix -Lv build .#ctc-smoke --no-link && nix -Lv run .#ctc-smoke`; flake check:
+`nix -Lv build .#checks.x86_64-linux.ctc-smoke --no-link`. Source: `ctc-smoke/Main.hs`. This clears
+the largest schedule risk; the literal `toCcc` path is open for larger transformer block fragments →
+full forwardT.
+
+Stage 3 gradient smoke is intentionally isolated in `ctc-grad-smoke/` and not included in flake
+checks. `ConCat.AD.gradient (\(x,y) -> x*x + y*y)` still exhausts GHC simplifier ticks under ghc948,
+even with `-funfolding-case-threshold=1`, `-funfolding-case-scaling=5`, `-freduction-depth=0`, and
+`-fsimpl-tick-factor=10000` (`$fPointed:*:`, total ticks 1864001). This is a gradient-specific CTC
+blocker, not a regression of the green forward/loss path.
 
 ---
 

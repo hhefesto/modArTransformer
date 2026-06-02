@@ -5,6 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
     haskell-flake.url = "github:srid/haskell-flake";
+    concat.url = "github:compiling-to-categories/concat";
     # Conal Elliott's Agda category library
     felix = {
       url = "github:conal/felix";
@@ -12,7 +13,7 @@
     };
   };
 
-  outputs = inputs@{ self, nixpkgs, flake-parts, haskell-flake, ... }:
+  outputs = inputs@{ self, nixpkgs, flake-parts, haskell-flake, concat, ... }:
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       imports = [ inputs.haskell-flake.flakeModule ];
@@ -122,6 +123,22 @@
                 || name == "checkpoint.ckpt.bak"
                 || (rel == "modArTransformer" && type != "directory"));
         };
+
+        ctcPkgs = import concat.inputs.nixpkgs {
+          inherit system;
+          overlays = [
+            concat.overlays.default
+            (final: prev: {
+              haskell = prev.haskell // {
+                packages = prev.haskell.packages // {
+                  ghc948 = prev.haskell.packages.ghc948.extend (hfinal: hprev: {
+                    "concat-plugin" = final.haskell.lib.dontCheck hprev."concat-plugin";
+                  });
+                };
+              };
+            })
+          ];
+        };
       in {
         haskellProjects.default = {
           basePackages = pkgs.haskellPackages;
@@ -131,6 +148,8 @@
 
         # Default build: compile the Agda project to a native executable (MAlonzo).
         packages.default = self'.packages.agda-modArTransformer;
+
+        packages.ctc-smoke = ctcPkgs.haskell.packages.ghc948.callCabal2nix "ctc-smoke" ./ctc-smoke { };
 
         packages.agda-modArTransformer = pkgs.stdenv.mkDerivation {
           name = "agda-modArTransformer";
@@ -197,6 +216,10 @@
           type = "app";
           program = "${self'.packages.modartransformer-backend}/bin/backend-train-epoch";
         };
+        apps.ctc-smoke = {
+          type = "app";
+          program = "${self'.packages.ctc-smoke}/bin/ctc-smoke";
+        };
 
         devShells.default = pkgs.mkShell {
           name = "modArTransformer-dev";
@@ -215,7 +238,7 @@
         };
 
         checks = {
-          inherit (self'.packages) agda-modArTransformer agda-modArTransformer-check agda-modArTensorDiagnostics modartransformer-backend;
+          inherit (self'.packages) agda-modArTransformer agda-modArTransformer-check agda-modArTensorDiagnostics modartransformer-backend ctc-smoke;
         };
       };
     };

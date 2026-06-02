@@ -155,6 +155,7 @@
 
         packages.ctc-smoke = ctcPkgs.haskell.packages.ghc948.callCabal2nix "ctc-smoke" ./ctc-smoke { };
         packages.ctc-grad-smoke = ctcPkgs.haskell.packages.ghc948.callCabal2nix "ctc-grad-smoke" ./ctc-grad-smoke { };
+        packages.ctc-train = ctcPkgs.haskell.packages.ghc948.callCabal2nix "ctc-train" ./ctc-train { };
 
         packages.agda-modArTransformer = pkgs.stdenv.mkDerivation {
           name = "agda-modArTransformer";
@@ -228,6 +229,10 @@
         apps.ctc-grad-smoke = {
           type = "app";
           program = "${self'.packages.ctc-grad-smoke}/bin/ctc-grad-smoke";
+        };
+        apps.ctc-train = {
+          type = "app";
+          program = "${self'.packages.ctc-train}/bin/ctc-train";
         };
 
         devShells.default = pkgs.mkShell {

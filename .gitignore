@@ -32,6 +32,7 @@ result-*
 MAlonzo/
 modArTransformer-agda
 ERROR_LOG
+train.log
 .#*
 
 # PureScript / Spago

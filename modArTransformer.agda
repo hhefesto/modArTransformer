@@ -23,7 +23,7 @@ import IO.Primitive.Core as Prim
 open import Data.String         using (_++_)
 open import IO                  using (IO; Main; run; putStrLn; _>>_; _>>=_; pure)
 
-open import ModArTransformer.Tensor using (_f*_)
+open import ModArTransformer.Tensor using (_f*_; _f-_)
 open import ModArTransformer.Layers.Transformer using (TransformerParams)
 open import ModArTransformer.Cat.Adamable
 open import ModArTransformer.Cat.Additive
@@ -48,7 +48,7 @@ private
   batchSize : ℕ ; batchSize = 32
   epochs    : ℕ ; epochs    = 500000
   seed0     : ℕ ; seed0     = 42
-  checkpointEvery : ℕ ; checkpointEvery = 10
+  checkpointEvery : ℕ ; checkpointEvery = 1
 
   baseLR   : Float ; baseLR  = 1.0e-3
   minLR    : Float ; minLR   = 1.0e-5
@@ -70,6 +70,7 @@ St = AdamState Par
 {-# FOREIGN GHC
   import System.Directory (doesFileExist)
   import System.IO        (hFlush, stdout)
+  import Data.Time.Clock.POSIX (getPOSIXTime)
 #-}
 
 postulate
@@ -77,12 +78,14 @@ postulate
   primReadFile      : String → Prim.IO String
   primWriteFile     : String → String → Prim.IO Unit
   primHFlushStdout  : Prim.IO Unit
+  primGetPOSIXTime  : Prim.IO Float
 
 {-# FOREIGN GHC import qualified Data.Text as T #-}
 {-# COMPILE GHC primDoesFileExist = \p -> doesFileExist (T.unpack p) #-}
 {-# COMPILE GHC primReadFile      = \p -> fmap T.pack (readFile (T.unpack p)) #-}
 {-# COMPILE GHC primWriteFile     = \p s -> writeFile (T.unpack p) (T.unpack s) #-}
 {-# COMPILE GHC primHFlushStdout  = hFlush stdout #-}
+{-# COMPILE GHC primGetPOSIXTime  = realToFrac <$> getPOSIXTime #-}
 
 doesFileExistIO : String → IO Bool
 doesFileExistIO q = lift (primDoesFileExist q)
@@ -92,6 +95,8 @@ writeFileIO : String → String → IO Unit
 writeFileIO q s = lift (primWriteFile q s)
 flushStdoutIO : IO {0ℓ} ⊤
 flushStdoutIO = lift′ primHFlushStdout
+currentTimeIO : IO Float
+currentTimeIO = lift primGetPOSIXTime
 
 saveCheckpointIO : Par → IO {0ℓ} ⊤
 saveCheckpointIO params = do
@@ -113,22 +118,26 @@ pct f = showF (f f* 100.0) ++ "%"
 trainLoop : ℕ → ℕ → Par → St
           → List (Example (suc p)) → List (Example (suc p)) → StdGen → IO {0ℓ} ⊤
 trainLoop zero    _     _      _    _  _  _ = putStrLn "Done." >> pure tt
-trainLoop (suc e) epoch params adam tr te g =
+trainLoop (suc e) epoch params adam tr te g = do
+  start ← currentTimeIO
   putStrLn ("[epoch] starting " ++ showN epoch)
-  >> flushStdoutIO
-  >> continue (trainEpoch epoch batchSize warmupSteps baseLR minLR cfg params adam tr g)
+  flushStdoutIO
+  continue start (trainEpoch epoch batchSize warmupSteps baseLR minLR cfg params adam tr g)
   where
     open import Data.Nat using (_≡ᵇ_)
-    continue : Par × St × Float × StdGen → IO {0ℓ} ⊤
-    continue (params' , adam' , loss , g') =
+    continue : Float → Par × St × Float × StdGen → IO {0ℓ} ⊤
+    continue start (params' , adam' , loss , g') = do
+      finish ← currentTimeIO
       let lossLine = showN epoch ++ " | loss=" ++ showF loss
           evalLine = lossLine
                   ++ " | train=" ++ pct (accuracy params' tr)
                   ++ " | test="  ++ pct (accuracy params' te)
-      in (if (epoch % 100) Data.Nat.≡ᵇ 0 then putStrLn evalLine else putStrLn lossLine)
-      >> flushStdoutIO
-      >> (if (epoch % checkpointEvery) Data.Nat.≡ᵇ 0 then saveCheckpointIO params' else pure tt)
-      >> trainLoop e (suc epoch) params' adam' tr te g'
+          seconds = finish f- start
+      if (epoch % 100) Data.Nat.≡ᵇ 0 then putStrLn evalLine else putStrLn lossLine
+      putStrLn ("[epoch] finished " ++ showN epoch ++ " in " ++ showF seconds ++ "s")
+      flushStdoutIO
+      if (epoch % checkpointEvery) Data.Nat.≡ᵇ 0 then saveCheckpointIO params' else pure tt
+      trainLoop e (suc epoch) params' adam' tr te g'
 
 -- ─── Checkpoint loading ────────────────────────────────────────────────────────
 

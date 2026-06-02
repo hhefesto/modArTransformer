@@ -7,12 +7,14 @@
 {-# OPTIONS --guardedness #-}
 module ModArTransformer.Train where
 
-open import Agda.Builtin.Float using (Float; primNatToFloat)
+open import Agda.Builtin.Float using (Float; primNatToFloat; primShowFloat)
+open import Agda.Builtin.String using (String)
 open import Data.Nat     using (ℕ; zero; suc)
 open import Data.List    using (List; []; _∷_; length)
 open import Data.Product using (_×_; _,_; proj₁; proj₂)
 open import Data.Bool    using (Bool; true; false; if_then_else_)
 open import Data.Fin     using (Fin; toℕ)
+open import Data.String  using (_++_)
 
 open import ModArTransformer.Tensor using (_f+_; _f/_; vmaxIndex)
 -- opened without `using` so their tensor/product instances are in scope:
@@ -32,11 +34,15 @@ private variable p dModel dFF dK : ℕ
 
 -- Strict foldl backed by Haskell's Data.List.foldl' to prevent thunk buildup.
 {-# FOREIGN GHC import qualified Data.List as DL #-}
+{-# FOREIGN GHC import qualified Data.Text as T #-}
+{-# FOREIGN GHC import qualified Debug.Trace as DT #-}
 postulate
   foldl' : {A B : Set} → (A → B → A) → A → List B → A
   seqBy  : {A B : Set} → A → B → B
+  traceBy : {A : Set} → String → A → A
 {-# COMPILE GHC foldl' = \ _ _ f z xs -> DL.foldl' f z xs #-}
 {-# COMPILE GHC seqBy  = \ _ _ x y -> seq x y #-}
+{-# COMPILE GHC traceBy = \ _ msg x -> DT.trace (T.unpack msg) x #-}
 
 private
   natEq : ℕ → ℕ → Bool
@@ -44,6 +50,12 @@ private
   natEq zero    (suc _) = false
   natEq (suc _) zero    = false
   natEq (suc m) (suc n) = natEq m n
+
+  showN : ℕ → String
+  showN n = primShowFloat (primNatToFloat n)
+
+  batchLine : ℕ → ℕ → String
+  batchLine ix total = "[batch] " ++ showN ix ++ " / " ++ showN total
 
 Params : ℕ → ℕ → ℕ → ℕ → Set
 Params p dModel dFF dK = TransformerParams p dModel dFF dK
@@ -105,13 +117,14 @@ private
            → ⦃ scaleP : Scale (Params p dModel dFF dK) ⦄
            → ⦃ adamP : Adamable (Params p dModel dFF dK) ⦄
            → ⦃ forceP : Forceable (Params p dModel dFF dK) ⦄
-           → Float → AdamConfig
-           → Params p dModel dFF dK × AdamState (Params p dModel dFF dK) × Float
+           → ℕ → Float → AdamConfig
+           → Params p dModel dFF dK × AdamState (Params p dModel dFF dK) × Float × ℕ
            → List (Example (suc p))
-           → Params p dModel dFF dK × AdamState (Params p dModel dFF dK) × Float
-  epochAcc ⦃ addP ⦄ ⦃ scaleP ⦄ ⦃ adamP ⦄ ⦃ forceP ⦄ lr cfg (params , adam , lacc) batch =
+           → Params p dModel dFF dK × AdamState (Params p dModel dFF dK) × Float × ℕ
+  epochAcc ⦃ addP ⦄ ⦃ scaleP ⦄ ⦃ adamP ⦄ ⦃ forceP ⦄ total lr cfg (params , adam , lacc , ix) batch =
     let (params' , adam' , bl) = trainBatch ⦃ addP ⦄ ⦃ scaleP ⦄ ⦃ adamP ⦄ ⦃ forceP ⦄ lr cfg params adam batch
-    in  seqBy (Forceable.force forceP params') (params' , adam' , lacc f+ bl)
+        result = seqBy (Forceable.force forceP params') (params' , adam' , lacc f+ bl , suc ix)
+    in  traceBy (batchLine ix total) result
 
 trainEpoch : ⦃ addP : Additive (Params p dModel dFF dK) ⦄
            → ⦃ scaleP : Scale (Params p dModel dFF dK) ⦄
@@ -125,7 +138,7 @@ trainEpoch ⦃ addP ⦄ ⦃ scaleP ⦄ ⦃ adamP ⦄ ⦃ forceP ⦄ epoch bsz wa
   let (shuffled , g1) = shuffleList trainData g0
       batches  = chunksOf bsz shuffled
       lr       = lrWarmupCosine epoch warmup baseLR minLR 500000
-      (params' , adam' , lossSum) =
-        foldl' (epochAcc ⦃ addP ⦄ ⦃ scaleP ⦄ ⦃ adamP ⦄ ⦃ forceP ⦄ lr cfg) (params , adam , 0.0) batches
       nB = length batches
+      (params' , adam' , lossSum , _) =
+        foldl' (epochAcc ⦃ addP ⦄ ⦃ scaleP ⦄ ⦃ adamP ⦄ ⦃ forceP ⦄ nB lr cfg) (params , adam , 0.0 , 1) batches
   in  (params' , adam' , (if natEq nB 0 then 0.0 else lossSum f/ primNatToFloat nB) , g1)

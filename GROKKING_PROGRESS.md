@@ -16,7 +16,8 @@ Plan file: `~/.claude/plans/read-opencode-s-latest-plan-quizzical-valley.md`
 - [x] Phase 2 — Fast Cont/Dual transformer forward pass (hmatrix-backed)
 - [x] Phase 3 — AdamW + per-step schedule + full checkpoint (from recovered Main.hs)
 - [~] Phase 4 — Verification ladder (grad check ✓, p=5 overfit ✓, p=53 timing ~, grokking pending)
-- [ ] Phase 5 — CTC compilation (acceptance gate; resolve Double# panic the Conal way)
+- [~] Phase 5 — CTC compilation (acceptance gate): plugin DE-RISKED via ctc-smoke (Bool/scalar/dot
+      all elaborate, no Double# panic); next: matvec → toCcc-able forwardT + parallel category
 - [ ] Phase 6 — Agda conformance oracle
 
 ## Decisions (from planning session)
@@ -106,10 +107,22 @@ historically. The wd=1e-3 vs wd=1e-2 contrast cleanly shows weight decay as the 
 (consistent with the historical note "99% test required wd=1e-3").
 
 ### Remaining plan items (not part of the grokking goal; for when you're back)
-- Phase 5: CTC acceptance gate — route the forward pass through `toCcc`, resolve the `Double#` panic
-  the Conal way (NumCat morphisms). Currently the trainer uses hand-written tape AD (validated).
+- Phase 5: CTC acceptance gate — route the forward pass through `toCcc`. Plugin DE-RISKED (see
+  below); next is a parallel-category interpretation and/or a `toCcc`-able categorical forwardT.
 - Phase 6: Agda conformance oracle — diff MAlonzo-evaluated Agda logits/loss against the backend.
 - Optional: let the canonical wd=1e-3 run continue toward the exact historical ~66k-epoch grokking.
+
+### Phase 5 — CTC plugin de-risk: VIABLE (no Double# panic) ★
+Staged `ctc-smoke` escalation through Conal's `concat` plugin (`toCcc`), all PASSING:
+- Stage 0 — Bool projection `\(x,_)->x`            → ctc=True (structural elaboration works)
+- Stage 1 — scalar Double `\(x,y)->x*y+1`          → ctc=13.0 (NumCat/FloatingCat works)
+- Stage 2 — numeric kernel `\((a,b),(c,d))->a*c+b*d` → ctc=11.0 (mul+add over Doubles works)
+
+Verdict: **the anticipated `Double#` panic does NOT occur** at the current pin — `concat` from
+the flake input (overlaid on **ghc948**, `dontCheck concat-plugin`, `flake.nix:127-141`) elaborates
+scalar and dot-product `Double` arithmetic with only `-fplugin=ConCat.Plugin` (no extra reboxing
+flags needed). Reproduce: `nix build .#ctc-smoke && nix run .#ctc-smoke`. Source: `ctc-smoke/Main.hs`.
+This clears the largest schedule risk; the literal `toCcc` path is open for matvec → full forwardT.
 
 ---
 

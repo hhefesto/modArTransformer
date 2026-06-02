@@ -142,6 +142,10 @@
       in {
         haskellProjects.default = {
           basePackages = pkgs.haskellPackages;
+          # Don't let haskell-flake own devShells.default — it collides with the
+          # explicit Agda dev shell below ("defined multiple times").  We fold the
+          # Haskell toolchain into that single shell instead.
+          autoWire = [ "packages" "checks" "apps" ];
         };
 
         # ── Agda packages ───────────────────────────────────────────────────
@@ -225,7 +229,12 @@
           name = "modArTransformer-dev";
           nativeBuildInputs = [
             myAgda          # agda preloaded with stdlib + felix interfaces
-            pkgs.ghc        # for `agda --compile` (MAlonzo → GHC)
+            # One GHC for both MAlonzo (`agda --compile`) and the Haskell backend
+            # (`cabal`).  Includes the backend deps + text (MAlonzo FFI).
+            (pkgs.haskellPackages.ghcWithPackages (p: [
+              p.hmatrix p.vector p.random p.text
+            ]))
+            pkgs.cabal-install
             pkgs.glibcLocales
           ];
           shellHook = ''
@@ -234,6 +243,7 @@
             echo "Agda ready (stdlib + felix interfaces preloaded)."
             echo "  Type-check: agda modArTransformer.agda"
             echo "  Compile:    agda --compile modArTransformer.agda"
+            echo "Haskell backend: cabal build (ghc has hmatrix/vector/random)."
           '';
         };
 

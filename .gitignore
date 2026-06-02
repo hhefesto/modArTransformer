@@ -33,8 +33,10 @@ MAlonzo/
 modArTransformer-agda
 ERROR_LOG
 train.log
+train-*.log
 checkpoint.ckpt
 checkpoint.ckpt.bak
+checkpoint-*.ckpt
 .#*
 
 # PureScript / Spago

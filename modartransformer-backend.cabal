@@ -36,3 +36,30 @@ executable backend-train-epoch
     RankNTypes
     ScopedTypeVariables
     TypeApplications
+
+-- Finite-difference gradient check for the categorical transformer (Phase 4a gate).
+executable transformer-gradcheck
+  main-is:          GradCheck.hs
+  hs-source-dirs:   backend/transformer
+  other-modules:    AD, Tensor, Tape, Serialize, Transformer
+  build-depends:    base >=4.17 && <5
+                  , hmatrix
+                  , random
+                  , vector
+                  , deepseq
+  ghc-options:      -O2 -threaded -rtsopts
+  default-language: Haskell2010
+
+-- Full transformer training toward grokking (p=53).
+executable backend-transformer-train
+  main-is:          Main.hs
+  hs-source-dirs:   backend/transformer
+  other-modules:    AD, Tensor, Tape, Serialize, Transformer, Optimizer
+  build-depends:    base >=4.17 && <5
+                  , hmatrix
+                  , random
+                  , directory
+                  , vector
+                  , deepseq
+  ghc-options:      -O2 -threaded -rtsopts "-with-rtsopts=-N -A64m -I0"
+  default-language: Haskell2010

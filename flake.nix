@@ -143,6 +143,21 @@
           '';
         };
 
+        packages.agda-modArTensorDiagnostics = pkgs.stdenv.mkDerivation {
+          name = "agda-modArTensorDiagnostics";
+          src = projectSource;
+          nativeBuildInputs = [ pkgs.agda pkgs.ghc pkgs.glibcLocales ];
+          LOCALE_ARCHIVE = "${pkgs.glibcLocales}/lib/locale/locale-archive";
+          LC_ALL = "en_US.UTF-8";
+          buildPhase = ''
+            agda -i ${stdlibCompiled}/src -i ${felixCompiled}/src --compile modArTensorDiagnostics.agda
+          '';
+          installPhase = ''
+            mkdir -p $out/bin
+            cp modArTensorDiagnostics $out/bin/agda-modArTensorDiagnostics
+          '';
+        };
+
         # Type-check only (fast CI gate, no GHC codegen).
         packages.agda-modArTransformer-check = pkgs.stdenv.mkDerivation {
           name = "agda-modArTransformer-check";
@@ -164,6 +179,10 @@
           program = "${self'.packages.agda-modArTransformer}/bin/agda-modArTransformer";
         };
         apps.agda-modArTransformer = self'.apps.default;
+        apps.tensor-diagnostics = {
+          type = "app";
+          program = "${self'.packages.agda-modArTensorDiagnostics}/bin/agda-modArTensorDiagnostics";
+        };
 
         devShells.default = pkgs.mkShell {
           name = "modArTransformer-dev";
@@ -182,7 +201,7 @@
         };
 
         checks = {
-          inherit (self'.packages) agda-modArTransformer agda-modArTransformer-check;
+          inherit (self'.packages) agda-modArTransformer agda-modArTransformer-check agda-modArTensorDiagnostics;
         };
       };
     };

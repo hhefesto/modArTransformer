@@ -36,6 +36,7 @@ open import ModArTransformer.Data
 open import ModArTransformer.Train
 open import ModArTransformer.Init
 open import ModArTransformer.Checkpoint
+open import ModArTransformer.Semantics.TensorNetwork using ()
 
 -- ─── Hyperparameters (Main.hs:1148-1167) ──────────────────────────────────────
 

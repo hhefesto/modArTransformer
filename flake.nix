@@ -4,6 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
+    haskell-flake.url = "github:srid/haskell-flake";
     # Conal Elliott's Agda category library
     felix = {
       url = "github:conal/felix";
@@ -11,9 +12,10 @@
     };
   };
 
-  outputs = inputs@{ self, nixpkgs, flake-parts, ... }:
+  outputs = inputs@{ self, nixpkgs, flake-parts, haskell-flake, ... }:
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      imports = [ inputs.haskell-flake.flakeModule ];
 
       perSystem = { self', pkgs, system, ... }:
       let
@@ -121,6 +123,10 @@
                 || (rel == "modArTransformer" && type != "directory"));
         };
       in {
+        haskellProjects.default = {
+          basePackages = pkgs.haskellPackages;
+        };
+
         # ── Agda packages ───────────────────────────────────────────────────
 
         # Default build: compile the Agda project to a native executable (MAlonzo).
@@ -183,6 +189,14 @@
           type = "app";
           program = "${self'.packages.agda-modArTensorDiagnostics}/bin/agda-modArTensorDiagnostics";
         };
+        apps.cont-ad-playground = {
+          type = "app";
+          program = "${self'.packages.modartransformer-backend}/bin/cont-ad-playground";
+        };
+        apps.backend-train-epoch = {
+          type = "app";
+          program = "${self'.packages.modartransformer-backend}/bin/backend-train-epoch";
+        };
 
         devShells.default = pkgs.mkShell {
           name = "modArTransformer-dev";
@@ -201,7 +215,7 @@
         };
 
         checks = {
-          inherit (self'.packages) agda-modArTransformer agda-modArTransformer-check agda-modArTensorDiagnostics;
+          inherit (self'.packages) agda-modArTransformer agda-modArTransformer-check agda-modArTensorDiagnostics modartransformer-backend;
         };
       };
     };

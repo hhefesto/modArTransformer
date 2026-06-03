@@ -188,6 +188,30 @@ Caveats (honest scope):
 Net: "CTC working + a training that utilises CTC for fast parallel training" is demonstrated on a
 modular-addition task; the working full-scale grokking trainer remains the tape/hmatrix backend.
 
+### CTC SCALING BOUNDARY — reverse-mode of self-ATTENTION does not compile here ✗
+Attempted (`ctc-train/XfTrain.hs`, kept but NOT built) to train an actual transformer block by CTC.
+Measured compile behaviour of `gradR` over the block at `d=2` (tiny), with `-fexpose-all-unfoldings
+-fsimpl-tick-factor=2000 -freduction-depth=0`:
+- Full block (attention + Wo + residual + **two sqrt-based LayerNorms** + FFN, ~32 params):
+  **memory runaway** — RSS 16 GB at 67 min, killed (heading to OOM).
+- Stripped block (attention softmax + sigmoid readout, **squared-error loss** so the only softmax
+  is the attention one, 20 params): **memory-bounded but time runaway** — 1h27m, RSS climbing
+  2.9 → 6.3 GB, still going; killed.
+
+Diagnosis: the cost is **reverse-mode (`gradR`) of the attention softmax**, not the plugin in
+general. The *forward* attention elaborates fine (`ctc-smoke` Stage 8, `toCcc @(->)`), and
+reverse-mode of a plain MLP compiles fine (`ctc-partrain`). It is the gradient of softmax
+self-attention whose Core grows impractically at this `concat`/ghc948 pin. (The `sqrt` LayerNorms
+add a *memory* blow-up on top; removing them leaves a *time* blow-up.) Conclusion: the full
+transformer cannot be CTC-compiled for training at this pin — consistent with ConCat's own
+`Vector`-net tests being commented out as failing. Would need a different concat/GHC pin, a
+softmax-free attention variant, or the parallel-category route on the tape backend.
+
+Tooling note for future attempts: all CTC cabal stanzas now pass `-dshow-passes`, so the
+otherwise-silent single-module `[1 of 1] Compiling Main` step prints each Core-to-Core pass with
+term size + timing — live progress, and an early signal of Core blow-up. For deeper tracing add
+`-fplugin-opt=ConCat.Plugin:trace`.
+
 ---
 
 ## ★ GROKKING ONSET OBSERVED (accelerated run, wd=1e-2) ★

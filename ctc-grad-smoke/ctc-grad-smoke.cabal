@@ -17,6 +17,7 @@ executable ctc-grad-smoke
                     -fexpose-all-unfoldings
                     -fsimpl-tick-factor=2000
                     -freduction-depth=0
+                    -dshow-passes
   default-language: Haskell2010
   default-extensions:
     ConstraintKinds

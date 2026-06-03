@@ -238,6 +238,10 @@
           type = "app";
           program = "${self'.packages.ctc-train}/bin/ctc-partrain";
         };
+        apps.ctc-attntrain = {
+          type = "app";
+          program = "${self'.packages.ctc-train}/bin/ctc-attntrain";
+        };
 
         devShells.default = pkgs.mkShell {
           name = "modArTransformer-dev";

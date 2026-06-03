@@ -55,6 +55,32 @@ executable ctc-partrain
     TypeFamilies
     TypeOperators
 
+executable ctc-attntrain
+  main-is:          AttnTrain.hs
+  build-depends:    base >=4.17 && <5
+                  , concat-classes
+                  , concat-examples
+                  , concat-plugin
+                  , ghc-prim
+                  , time
+  ghc-options:      -O2 -threaded -rtsopts "-with-rtsopts=-N"
+                    -fplugin=ConCat.Plugin
+                    -fexpose-all-unfoldings
+                    -fsimpl-tick-factor=2000
+                    -freduction-depth=0
+                    -dshow-passes
+  default-language: Haskell2010
+  default-extensions:
+    BangPatterns
+    ConstraintKinds
+    DataKinds
+    FlexibleContexts
+    FlexibleInstances
+    ScopedTypeVariables
+    TypeApplications
+    TypeFamilies
+    TypeOperators
+
 -- NOTE: the self-attention block trainer XfTrain.hs is intentionally NOT built.
 -- Its gradient (gradR over softmax self-attention) does not compile in practical
 -- time/memory at this concat/ghc948 pin: a d=2, 20-param instance ran 1h27m with

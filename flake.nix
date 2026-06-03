@@ -156,6 +156,10 @@
         packages.ctc-smoke = ctcPkgs.haskell.packages.ghc948.callCabal2nix "ctc-smoke" ./ctc-smoke { };
         packages.ctc-grad-smoke = ctcPkgs.haskell.packages.ghc948.callCabal2nix "ctc-grad-smoke" ./ctc-grad-smoke { };
         packages.ctc-train = ctcPkgs.haskell.packages.ghc948.callCabal2nix "ctc-train" ./ctc-train { };
+        # Heavy, isolated full-attention-block trainer — NOT in checks (its
+        # gradient compile is the documented ~1h27m+ case). Build/run by hand:
+        #   nix build .#ctc-xftrain -L && ./result/bin/ctc-xftrain
+        packages.ctc-xftrain = ctcPkgs.haskell.packages.ghc948.callCabal2nix "ctc-xftrain" ./ctc-xftrain { };
 
         packages.agda-modArTransformer = pkgs.stdenv.mkDerivation {
           name = "agda-modArTransformer";
@@ -241,6 +245,10 @@
         apps.ctc-attntrain = {
           type = "app";
           program = "${self'.packages.ctc-train}/bin/ctc-attntrain";
+        };
+        apps.ctc-xftrain = {
+          type = "app";
+          program = "${self'.packages.ctc-xftrain}/bin/ctc-xftrain";
         };
 
         devShells.default = pkgs.mkShell {

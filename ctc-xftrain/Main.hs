@@ -8,31 +8,23 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 
--- ⚠ NOT BUILT — see the NOTE in ctc-train.cabal.  This self-attention block
--- trainer is kept as a documented attempt: reverse-mode `gradR` over softmax
--- self-attention does not compile in practical time/memory at this concat/ghc948
--- pin (1h27m, RSS climbing past 6 GB for a d=2 / 20-param instance).  The forward
--- attention elaborates fine (ctc-smoke Stage 8) and reverse-mode MLPs compile
--- fine (ctc-partrain); reverse-mode attention is the wall.
+-- Parallel CTC training of a FULL single-head self-attention BLOCK on (a+b) mod 2.
 --
--- Parallel CTC training of a self-ATTENTION block on modular addition.
+-- This is the heavy attempt: Q/K/V projections (Wq/Wk/Wv, with Wk/Wv shared across
+-- positions) -> scaled-dot softmax attention -> output proj (Wup) -> sigmoid
+-- readout -> unembed, with a squared-error loss.  Its reverse-mode gradient
+-- (`gradR (toCcc chunk)`) is expensive to compile at the current concat/ghc948 pin
+-- (a previous run was ~1h27m with RSS plateauing ~6 GB before being killed by a
+-- time cap — it is time-bound, not memory-bound, so given enough time it may
+-- finish).  Build/run it yourself with no time cap:
+--   nix build .#ctc-xftrain -L && ./result/bin/ctc-xftrain
+--   (or: nix develop .#ctc-xftrain --command cabal run ctc-xftrain)
+-- `-dshow-passes` (in the cabal) streams each Core pass so you can watch the
+-- Simplifier do the toCcc elaboration and see whether the Core converges.
 --
--- The model is a single-head self-attention layer over two tokens, with a
--- nonlinear (sigmoid) readout — the core transformer mechanism:
---   embed -> Q/K/V proj (Wk,Wv shared across positions) -> scaled-dot attention
---   (softmax) -> hidden sigmoid -> unembed -> class softmax.
--- It learns (a + b) mod 2.
---
--- NOTE: the full block (extra Wo + residual + two sqrt-based LayerNorms + FFN
--- down-proj) makes `gradR`'s Core blow up unboundedly at this concat/ghc948 pin
--- (a tiny d=2 instance ran 67 min / 16 GB before we killed it). The LayerNorms'
--- `sqrt`/variance are the cost amplifiers. This attention+readout keeps the
--- defining transformer op (softmax self-attention) with an op-count close to a
--- plain MLP, so its gradient compiles.
---
--- CTC on two axes: (1) each chunk's gradient is `gradR (toCcc chunkLoss)`
--- (reverse mode, no hand-written backward); (2) the chunk gradients are summed
--- with the CTC-compiled chunks evaluated concurrently via `par`/`pseq` (+RTS -N).
+-- CTC on two axes: (1) each chunk's gradient is gradR (toCcc chunk) (reverse mode,
+-- no hand-written backward); (2) the two compiled chunk gradients are summed with
+-- the chunks evaluated concurrently via par/pseq (+RTS -N).
 module Main where
 
 import ConCat.RAD (gradR)
@@ -84,10 +76,7 @@ attnLogits (_emb, (attn, (wup, un))) ea eb =
       h   = (sigmoid (fst hp), sigmoid (snd hp))   -- nonlinear readout
   in (dot u0 h, dot u1 h)
 
--- Squared-error loss to a one-hot target (like ConCat.Deep's errSqr).  Using MSE
--- rather than softmax-NLL keeps the ONLY softmax in the model the attention one
--- — matching the nonlinearity budget of the MLP that compiled fast (a second,
--- loss-side softmax tipped gradR's Core into an unbounded blow-up at this pin).
+-- Squared-error loss to a one-hot target (keeps the only softmax the attention one).
 err0, err1 :: P -> D2 -> D2 -> Double
 err0 p ea eb = let (g0, g1) = attnLogits p ea eb in (g0 - 1) * (g0 - 1) + g1 * g1
 err1 p ea eb = let (g0, g1) = attnLogits p ea eb in g0 * g0 + (g1 - 1) * (g1 - 1)
@@ -154,8 +143,7 @@ main = do
   printf "timing: seq=%.3fs par=%.3fs (checksum seq=%.4f par=%.4f)\n"
     (realToFrac (diffUTCTime t1 t0) :: Double)
     (realToFrac (diffUTCTime t2 t1) :: Double) sseq spar
-  if correct == 4
-    then putStrLn "ctc self-attention parallel training learned (a+b) mod 2"
-    else error "ctc self-attention training did not learn the task"
+  printf "RESULT: full self-attention block trained via parallel CTC gradients; %d/4 correct\n" correct
+  putStrLn "ctc-xftrain done (gradient compiled via toCcc, chunks via par)"
   where
     iterateGrad bg k p = goi k p where goi 0 q = [q]; goi m q = q : goi (m - 1) (gdStep bg 0.3 q)

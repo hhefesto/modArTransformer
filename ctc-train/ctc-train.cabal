@@ -81,12 +81,8 @@ executable ctc-attntrain
     TypeFamilies
     TypeOperators
 
--- NOTE: the self-attention block trainer XfTrain.hs is intentionally NOT built.
--- Its gradient (gradR over softmax self-attention) does not compile in practical
--- time/memory at this concat/ghc948 pin: a d=2, 20-param instance ran 1h27m with
--- RSS climbing past 6 GB (the full block with LayerNorms hit 16 GB / 67 min). The
--- forward attention elaborates fine (ctc-smoke Stage 8) and reverse-mode MLPs
--- compile fine (ctc-partrain); reverse-mode *attention* is the wall. To retry,
--- re-add an `executable ctc-xftrain` (main-is XfTrain.hs) with the flags above
--- plus -dshow-passes (and optionally -fplugin-opt=ConCat.Plugin:trace) to watch
--- whether the Core converges or grows unboundedly.
+-- NOTE: the full self-attention BLOCK trainer (Wq/Wk/Wv projections) lives in its
+-- own isolated package `ctc-xftrain` (../ctc-xftrain), kept out of this package and
+-- out of flake checks because its gradient compile is the documented heavy case
+-- (~1h27m+ at this concat/ghc948 pin). Build/run it by hand:
+--   nix build .#ctc-xftrain -L && ./result/bin/ctc-xftrain

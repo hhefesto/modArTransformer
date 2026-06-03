@@ -21,7 +21,9 @@ executable ctc-xftrain
   ghc-options:      -O2 -threaded -rtsopts "-with-rtsopts=-N"
                     -fplugin=ConCat.Plugin
                     -fexpose-all-unfoldings
-                    -fsimpl-tick-factor=2000
+                    -funfolding-case-threshold=1
+                    -funfolding-case-scaling=5
+                    -fsimpl-tick-factor=8000
                     -freduction-depth=0
                     -dshow-passes
   default-language: Haskell2010

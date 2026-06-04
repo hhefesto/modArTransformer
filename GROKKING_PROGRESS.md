@@ -320,3 +320,23 @@ self-attention) but is **not beneficial** for this small-model/CPU grok task:
   GPU, fewer epochs via hyperparameters, or data-parallel batching — none of them CTC.
 Conclusion: the hand-written **Wengert-tape / hmatrix backend remains the production trainer**; CTC's
 genuine niche (large models on parallel/GPU hardware, one compile amortized) does not match this task.
+
+## Two-LAYER transformer (p=97, seed 36, from zero) @ 2026-06-04
+Added a 2-layer model (two stacked transformer blocks; both token positions flow through each block
+so layer 2 attends over layer 1's outputs) — closer to the grokking paper's architecture. Mode
+`p97l2`. **112,609 parameters** (≈2× the 1-layer's 62,625). Same hyperparameters as `p97hi`
+(wd=1e-2, flat lr, batch 32, split 0.5). Timing is now explicit (stop line reports total
+steps/seconds/s-per-epoch; per-epoch `elapsed` column).
+
+| layers | grok point (test≥99%) | steps  | wall-clock | s/epoch | test@epoch100 |
+|-------:|----------------------:|-------:|-----------:|--------:|--------------:|
+| 1      | epoch 200             | 29,400 | ~13.2 min  | ~3.9 s  | 98.6%         |
+| **2**  | epoch 200             | **29,400** | **~29.7 min** | ~8.9 s | 39.4% (climbing) |
+
+Findings: both reach high test at the **same step count** (29,400 = epoch 200), but the 2-layer
+takes ~2.25× the wall-clock (more params, both positions through two blocks). The 2-layer's curve is
+**more gradual / paper-like**: 39.4% test at epoch 100 (vs the 1-layer's 98.6%) then a sharper climb
+to 99.7% by epoch 200 — extra depth delays generalization in epochs even though the step-count to
+grok matches here. Reproduce: `cabal run -v0 backend-transformer-train -- p97l2 2000 36`
+(also `p53l2`, `p5l2`). Validated end-to-end (p5l2 overfits to 100% train; gradient correct by
+construction + the 1-layer gradcheck shares the same tape primitives).

@@ -5,7 +5,6 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
     haskell-flake.url = "github:srid/haskell-flake";
-    concat.url = "github:compiling-to-categories/concat";
     # Conal Elliott's Agda category library
     felix = {
       url = "github:conal/felix";
@@ -13,7 +12,7 @@
     };
   };
 
-  outputs = inputs@{ self, nixpkgs, flake-parts, haskell-flake, concat, ... }:
+  outputs = inputs@{ self, nixpkgs, flake-parts, haskell-flake, ... }:
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       imports = [ inputs.haskell-flake.flakeModule ];
@@ -124,21 +123,6 @@
                 || (rel == "modArTransformer" && type != "directory"));
         };
 
-        ctcPkgs = import concat.inputs.nixpkgs {
-          inherit system;
-          overlays = [
-            concat.overlays.default
-            (final: prev: {
-              haskell = prev.haskell // {
-                packages = prev.haskell.packages // {
-                  ghc948 = prev.haskell.packages.ghc948.extend (hfinal: hprev: {
-                    "concat-plugin" = final.haskell.lib.dontCheck hprev."concat-plugin";
-                  });
-                };
-              };
-            })
-          ];
-        };
       in {
         haskellProjects.default = {
           basePackages = pkgs.haskellPackages;
@@ -152,14 +136,6 @@
 
         # Default build: compile the Agda project to a native executable (MAlonzo).
         packages.default = self'.packages.agda-modArTransformer;
-
-        packages.ctc-smoke = ctcPkgs.haskell.packages.ghc948.callCabal2nix "ctc-smoke" ./ctc-smoke { };
-        packages.ctc-grad-smoke = ctcPkgs.haskell.packages.ghc948.callCabal2nix "ctc-grad-smoke" ./ctc-grad-smoke { };
-        packages.ctc-train = ctcPkgs.haskell.packages.ghc948.callCabal2nix "ctc-train" ./ctc-train { };
-        # Heavy, isolated full-attention-block trainer — NOT in checks (its
-        # gradient compile is the documented ~1h27m+ case). Build/run by hand:
-        #   nix build .#ctc-xftrain -L && ./result/bin/ctc-xftrain
-        packages.ctc-xftrain = ctcPkgs.haskell.packages.ghc948.callCabal2nix "ctc-xftrain" ./ctc-xftrain { };
 
         packages.agda-modArTransformer = pkgs.stdenv.mkDerivation {
           name = "agda-modArTransformer";
@@ -218,38 +194,6 @@
           type = "app";
           program = "${self'.packages.agda-modArTensorDiagnostics}/bin/agda-modArTensorDiagnostics";
         };
-        apps.cont-ad-playground = {
-          type = "app";
-          program = "${self'.packages.modartransformer-backend}/bin/cont-ad-playground";
-        };
-        apps.backend-train-epoch = {
-          type = "app";
-          program = "${self'.packages.modartransformer-backend}/bin/backend-train-epoch";
-        };
-        apps.ctc-smoke = {
-          type = "app";
-          program = "${self'.packages.ctc-smoke}/bin/ctc-smoke";
-        };
-        apps.ctc-grad-smoke = {
-          type = "app";
-          program = "${self'.packages.ctc-grad-smoke}/bin/ctc-grad-smoke";
-        };
-        apps.ctc-train = {
-          type = "app";
-          program = "${self'.packages.ctc-train}/bin/ctc-train";
-        };
-        apps.ctc-partrain = {
-          type = "app";
-          program = "${self'.packages.ctc-train}/bin/ctc-partrain";
-        };
-        apps.ctc-attntrain = {
-          type = "app";
-          program = "${self'.packages.ctc-train}/bin/ctc-attntrain";
-        };
-        apps.ctc-xftrain = {
-          type = "app";
-          program = "${self'.packages.ctc-xftrain}/bin/ctc-xftrain";
-        };
 
         devShells.default = pkgs.mkShell {
           name = "modArTransformer-dev";
@@ -274,7 +218,7 @@
         };
 
         checks = {
-          inherit (self'.packages) agda-modArTransformer agda-modArTransformer-check agda-modArTensorDiagnostics modartransformer-backend ctc-smoke ctc-grad-smoke;
+          inherit (self'.packages) agda-modArTransformer agda-modArTransformer-check agda-modArTensorDiagnostics modartransformer-backend;
         };
       };
     };

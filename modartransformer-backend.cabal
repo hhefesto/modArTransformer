@@ -5,38 +5,6 @@ synopsis:           Backend experiments for the modular arithmetic transformer
 license:            MIT
 build-type:         Simple
 
-executable cont-ad-playground
-  main-is:          ContADPlayground.hs
-  hs-source-dirs:   backend
-  other-modules:    AD
-                  , Cat
-                  , Tensor
-  build-depends:    base >=4.17 && <5
-  ghc-options:      -O2 -Wall -threaded -rtsopts
-  default-language: Haskell2010
-  default-extensions:
-    DataKinds
-    KindSignatures
-    RankNTypes
-    ScopedTypeVariables
-    TypeApplications
-
-executable backend-train-epoch
-  main-is:          BackendTrainEpoch.hs
-  hs-source-dirs:   backend
-  other-modules:    Cat
-                  , AD
-                  , Tensor
-  build-depends:    base >=4.17 && <5
-  ghc-options:      -O2 -Wall -threaded -rtsopts
-  default-language: Haskell2010
-  default-extensions:
-    DataKinds
-    KindSignatures
-    RankNTypes
-    ScopedTypeVariables
-    TypeApplications
-
 -- Finite-difference gradient check for the categorical transformer (Phase 4a gate).
 executable transformer-gradcheck
   main-is:          GradCheck.hs

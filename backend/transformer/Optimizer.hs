@@ -25,6 +25,9 @@ module Optimizer
   ) where
 
 import GHC.TypeNats (KnownNat)
+import Control.Monad.ST (runST)
+import qualified Data.Vector as V
+import qualified Data.Vector.Mutable as MV
 import qualified Numeric.LinearAlgebra as LA
 import System.Random (StdGen, randomR)
 import Tensor
@@ -122,16 +125,24 @@ chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf k xs = let (h, t) = splitAt k xs in h : chunksOf k t
 
--- Fisher-Yates shuffle threading a StdGen.
+-- O(n) Fisher-Yates over a mutable boxed vector, threading a StdGen.  (The old
+-- list version was O(n²) via splitAt/++ per element — wasteful at every epoch.)
+-- Note: the draw sequence differs from the old version, so the per-seed data
+-- order changes (still uniform, still deterministic per seed).
 shuffle :: StdGen -> [a] -> ([a], StdGen)
-shuffle g0 xs0 = go g0 (length xs0) xs0
-  where
-    go g _ [] = ([], g)
-    go g n xs =
-      let (i, g') = randomR (0, n - 1) g
-          (pre, y : post) = splitAt i xs
-      in let (rest, g'') = go g' (n - 1) (pre ++ post)
-         in (y : rest, g'')
+shuffle g0 xs0 = runST $ do
+  let v0 = V.fromList xs0
+      n  = V.length v0
+  mv <- V.thaw v0
+  let go i g
+        | i <= 0    = pure g
+        | otherwise = do
+            let (j, g') = randomR (0 :: Int, i) g
+            MV.swap mv i j
+            go (i - 1) g'
+  gN <- go (n - 1) g0
+  v  <- V.freeze mv
+  pure (V.toList v, gN)
 
 splitData :: Double -> StdGen -> [a] -> ([a], [a], StdGen)
 splitData frac g xs =

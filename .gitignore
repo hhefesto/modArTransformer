@@ -37,6 +37,8 @@ train-*.log
 checkpoint.ckpt
 checkpoint.ckpt.bak
 checkpoint-*.ckpt
+checkpoint.ckpt.tmp
+checkpoint-*.ckpt.tmp
 .#*
 
 # PureScript / Spago
@@ -51,3 +53,6 @@ purescript/output/
 conformance-params.txt
 conformance-hs.txt
 conformance-agda.txt
+
+# Claude Code: track settings.local.json, ignore the runtime scheduler lock
+.claude/scheduled_tasks.lock

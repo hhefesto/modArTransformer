@@ -233,7 +233,7 @@
             # One GHC for both MAlonzo (`agda --compile`) and the Haskell backend
             # (`cabal`).  Includes the backend deps + text (MAlonzo FFI).
             (pkgs.haskellPackages.ghcWithPackages (p: [
-              p.hmatrix p.vector p.random p.text
+              p.hmatrix p.vector p.random p.text p.optparse-applicative p.parallel
             ]))
             pkgs.cabal-install
             pkgs.glibcLocales
@@ -241,10 +241,16 @@
           shellHook = ''
             export LOCALE_ARCHIVE="${pkgs.glibcLocales}/lib/locale/locale-archive"
             export LC_ALL="en_US.UTF-8"
+            # Keep BLAS single-threaded: the model's matrices are tiny (64x64), so
+            # multi-threaded BLAS is pure overhead and would oversubscribe against the
+            # example-level parallelism in the training loop (parMap over the batch).
+            export OPENBLAS_NUM_THREADS=1
+            export OMP_NUM_THREADS=1
             echo "Agda ready (stdlib + felix interfaces preloaded)."
             echo "  Type-check: agda modArTransformer.agda"
             echo "  Compile:    agda --compile modArTransformer.agda"
-            echo "Haskell backend: cabal build (ghc has hmatrix/vector/random)."
+            echo "Haskell backend: cabal build (ghc has hmatrix/vector/random/parallel)."
+            echo "BLAS pinned to 1 thread (OPENBLAS_NUM_THREADS=1); training parallelizes the batch (run with +RTS -N)."
           '';
         };
 

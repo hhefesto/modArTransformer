@@ -12,9 +12,13 @@
 module Main where
 
 import Data.List (foldl')
-import System.Environment (getArgs)
-import System.Directory (doesFileExist)
-import System.IO (hFlush, stdout)
+import Data.Maybe (fromMaybe)
+import Control.DeepSeq (NFData)
+import Control.Parallel.Strategies (parMap, rdeepseq, rseq, parListChunk, using)
+import qualified Options.Applicative as O
+import System.Directory (doesFileExist, renameFile)
+import System.IO (hFlush, hPutStrLn, stdout, stderr)
+import System.Exit (exitFailure)
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import Text.Printf (printf)
 import System.Random (StdGen, mkStdGen, randomR)
@@ -90,50 +94,82 @@ argmaxList :: [Double] -> Int
 argmaxList xs = snd (foldl' step (head xs, 0) (zip xs [0 ..]))
   where step (best, bi) (x, i) = if x > best then (x, i) else (best, bi)
 
+-- ── parallel batch primitives (model-agnostic) ─────────────────────────────────
+--
+-- Each example's reverse pass is an independent runST/tape, and `addA` is the
+-- cotangent monoid (commutative+associative), so per-example gradients can be
+-- evaluated concurrently and summed.  `parMap` preserves order and the fold runs
+-- in that order, so the summed gradient is numerically identical to a sequential
+-- fold — parallelism here changes wall-clock only, not the result.  `rdeepseq`
+-- forces the whole gradient inside the spark (WHNF would leave matrices as thunks
+-- and the work would leak back out sequentially — hence the NFData constraint).
+
+parBatchGrad :: (Additive p, NFData p)
+             => (Int -> Int -> Int -> p -> (p, Double)) -> p -> [(Int, Int, Int)] -> (p, Double)
+parBatchGrad grad ps batch =
+  foldl' (\(!gA, !lA) (g, l) -> (addA gA g, lA + l)) (zeroA, 0)
+         (parMap rdeepseq (\(a, b, t) -> grad a b t ps) batch)
+
+-- accuracy over a dataset, examples scored in parallel (chunked to bound spark count).
+parAccuracy :: (Int -> Int -> p -> V v) -> p -> [(Int, Int, Int)] -> Double
+parAccuracy _      _  [] = 0
+parAccuracy logits ps xs =
+  let hits = ([ if argmaxList (vtoList (logits a b ps)) == t then 1 else 0
+              | (a, b, t) <- xs ] :: [Int]) `using` parListChunk 64 rseq
+  in fromIntegral (sum hits) / fromIntegral (length xs)
+
 accuracy :: forall v dM dF dK. ParamsC v dM dF dK
          => Params v dM dF dK -> [(Int, Int, Int)] -> Double
-accuracy _ [] = 0
-accuracy ps xs =
-  let correct = length [ () | (a, b, t) <- xs
-                            , argmaxList (vtoList (transformerLogitsVal a b ps)) == t ]
-  in fromIntegral correct / fromIntegral (length xs)
+accuracy = parAccuracy transformerLogitsVal
 
 -- ── batch / epoch ─────────────────────────────────────────────────────────────
 
--- accumulate gradient and loss over a batch (one chain-rule reverse pass per example)
+-- accumulate gradient and loss over a batch (one chain-rule reverse pass per
+-- example, examples evaluated in parallel — see parBatchGrad).
 batchGradLoss :: forall v dM dF dK. ParamsC v dM dF dK
               => Params v dM dF dK -> [(Int, Int, Int)] -> (Params v dM dF dK, Double)
-batchGradLoss ps batch =
-  foldl' step (zeroA, 0) batch
-  where
-    step (!gAcc, !lAcc) (a, b, t) =
-      let (g, l) = transformerGradLoss a b t ps
-      in (addA gAcc g, lAcc + l)
+batchGradLoss = parBatchGrad transformerGradLoss
 
 -- ── checkpoint ──────────────────────────────────────────────────────────────────
 
+-- Atomic save: write a sibling temp file, then rename into place.  rename is
+-- atomic on the same filesystem (the temp lives in the same dir), so a save
+-- interrupted mid-write leaves only the partial `.tmp` — the resumable checkpoint
+-- at `path` is never corrupted.
 saveCkpt :: Serialize p => FilePath -> p -> AdamState p -> Int -> IO ()
 saveCkpt path ps st epoch = do
-  let header = unwords [ "CHECKPOINT_ADAMW", show epoch
+  let tmp    = path ++ ".tmp"
+      header = unwords [ "CHECKPOINT_ADAMW", show epoch
                        , show (asT st), show (asB1Pow st), show (asB2Pow st) ]
       body   = toFloats ps ++ toFloats (asM st) ++ toFloats (asV st)
-  writeFile path (unlines (header : map show body))
+  writeFile tmp (unlines (header : map show body))
+  renameFile tmp path
 
-loadCkpt :: Serialize p => FilePath -> IO (Maybe (p, AdamState p, Int))
-loadCkpt path = do
+-- Load + validate.  `nParam` is the expected per-section float count; a file whose
+-- body isn't exactly 3*nParam floats (params + Adam m + v) is incomplete/corrupt
+-- (e.g. an interrupted pre-atomic-save) — fail loudly instead of crashing deep in
+-- `fromFloats` with a cryptic shape error.
+loadCkpt :: Serialize p => Int -> FilePath -> IO (Maybe (p, AdamState p, Int))
+loadCkpt nParam path = do
   exists <- doesFileExist path
   if not exists then pure Nothing else do
     contents <- readFile path
     length contents `seq` pure ()
     case lines contents of
       (header : rest) -> case words header of
-        ("CHECKPOINT_ADAMW" : e : ts : b1 : b2 : _) ->
-          let nums = map read rest
-              (ps,  r1) = fromFloats nums
-              (mm,  r2) = fromFloats r1
-              (vv,  _)  = fromFloats r2
-              st = AdamState (read ts) (read b1) (read b2) mm vv
-          in pure (Just (ps, st, read e))
+        ("CHECKPOINT_ADAMW" : e : ts : b1 : b2 : _)
+          | length rest == 3 * nParam ->
+              let nums = map read rest
+                  (ps,  r1) = fromFloats nums
+                  (mm,  r2) = fromFloats r1
+                  (vv,  _)  = fromFloats r2
+                  st = AdamState (read ts) (read b1) (read b2) mm vv
+              in pure (Just (ps, st, read e))
+          | otherwise -> do
+              hPutStrLn stderr $ "loadCkpt: " ++ path ++ " is incomplete/corrupt — "
+                ++ show (length rest) ++ " floats, expected " ++ show (3 * nParam)
+                ++ " (likely an interrupted save). Delete it to start fresh."
+              exitFailure
         _ -> pure Nothing
       _ -> pure Nothing
 
@@ -175,14 +211,16 @@ train cfg modelDesc (vI, dMI, dFI, dKI) mkInit bgrad acc = do
       (tr0, te0, _) = splitData (cFrac cfg) g0 allData
       batchesPer = length (chunksOf (cBatch cfg) tr0)
       totalSteps = cSchedEp cfg * max 1 batchesPer
-  loaded <- loadCkpt (cCkpt cfg)
+  let freshP         = mkInit g0
+      nParamExpected = length (toFloats freshP)
+  loaded <- loadCkpt nParamExpected (cCkpt cfg)
   (params0, st0, startEpoch) <- case loaded of
     Just (ps, st, e) -> do
       printf "Resumed %s at epoch %d (step %d)\n" (cCkpt cfg) e (asT st)
       pure (ps, st, e + 1)
     Nothing -> do
       printf "Fresh init (Xavier).\n"
-      pure (mkInit g0, initAdam, 1)
+      pure (freshP, initAdam, 1)
   -- ── detailed run header: what is being trained, how, and why it matters ──────
   let p2     = p * p
       nParam = length (toFloats params0)
@@ -311,61 +349,69 @@ train2W cfg _ =
         dFI = fromIntegral (natVal (Proxy @dF)) :: Int
         dKI = fromIntegral (natVal (Proxy @dK)) :: Int
         mkInit g = fst (fromFloats (fst (initFlat2 vI dMI dFI dKI g))) :: Params2 v dM dF dK
-        bgrad ps = foldl' step (zeroA, 0)
-          where step (!gA, !lA) (a, b, t) =
-                  let (g, l) = transformerGradLoss2 a b t ps in (addA gA g, lA + l)
-        acc _  [] = 0
-        acc ps xs =
-          let correct = length [ () | (a, b, t) <- xs
-                                    , argmaxList (vtoList (transformerLogitsVal2 a b ps)) == t ]
-          in fromIntegral correct / fromIntegral (length xs)
+        bgrad = parBatchGrad transformerGradLoss2
+        acc   = parAccuracy transformerLogitsVal2
 
 -- ── entry ───────────────────────────────────────────────────────────────────────
 
--- Usage: backend-transformer-train [MODE] [MAX_EPOCHS] [SEED]
---   MODE       p5 | p53 | p53hi | p97 | p97hi        (1-layer)
---              p5l2 | p53l2 | p97l2                  (2-layer — like the paper)
---              (default p53)
---   MAX_EPOCHS epochs to run THIS invocation (resumes from checkpoint)
---   SEED       RNG seed for split/init/shuffle (default 42; vary for non-identical runs)
+-- Usage: backend-transformer-train [-m MODE] [-e N] [-s N] [-c PATH]
+--   -m / --mode        p5 | p53 | p53hi | p97 | p97hi   (1-layer)
+--                      p5l2 | p53l2 | p97l2             (2-layer — like the paper)
+--                      (default p97l2 — the paper's modulus, 2 layers)
+--   -e / --epochs      epochs to run THIS invocation (default: per-mode; resumes from checkpoint)
+--   -s / --seed        RNG seed for split/init/shuffle (default 42)
+--   -c / --checkpoint  checkpoint file (default checkpoint-<mode>.ckpt)
+--   -h / --help        auto-generated usage (lists all flags + defaults)
+data Opts = Opts
+  { optMode   :: String          -- -m / --mode        (default "p53")
+  , optEpochs :: Maybe Int       -- -e / --epochs      (Nothing → per-mode default)
+  , optSeed   :: Int             -- -s / --seed        (default 42)
+  , optCkpt   :: Maybe FilePath  -- -c / --checkpoint  (Nothing → checkpoint-<mode>.ckpt)
+  }
+
+optsP :: O.Parser Opts
+optsP = Opts
+  <$> O.strOption (O.long "mode" <> O.short 'm' <> O.metavar "MODE"
+        <> O.value "p97l2" <> O.showDefault
+        <> O.help "p5|p53|p53hi|p97|p97hi (1-layer); p5l2|p53l2|p97l2 (2-layer)")
+  <*> O.optional (O.option O.auto (O.long "epochs" <> O.short 'e' <> O.metavar "N"
+        <> O.help "epochs to run this invocation (default: per-mode — 1000, 2000 for p5)"))
+  <*> O.option O.auto (O.long "seed" <> O.short 's' <> O.metavar "N"
+        <> O.value 42 <> O.showDefault
+        <> O.help "RNG seed for split/init/shuffle (run is deterministic per seed)")
+  <*> O.optional (O.strOption (O.long "checkpoint" <> O.short 'c' <> O.metavar "PATH"
+        <> O.help "checkpoint file (default checkpoint-<mode>.ckpt); resumes if present"))
+
 main :: IO ()
 main = do
-  args <- getArgs
-  let (mode, rest) = case args of (m : r) -> (m, r); [] -> ("p53", [])
-      seed = readArg 1 42 rest
-  case mode of
-    "p5" ->
-      train1 (Cfg 5 1.0 25 5000 200 1.0e-3 1.0e-5 50 500 (readArg 0 2000 rest) "checkpoint-p5.ckpt" 1.0e-3 seed)
-             (Proxy @'(5, 16, 64, 16))
+  o <- O.execParser $ O.info (optsP O.<**> O.helper)
+         ( O.fullDesc
+           <> O.header "backend-transformer-train — denotational modular-arithmetic transformer"
+           <> O.progDesc "Train (a+b) mod p via reverse-mode AD on a Wengert tape; reproduces grokking." )
+  case optMode o of
+    "p5"    -> train1  (mk o 5  1.0 25 5000   200  2000 "checkpoint-p5.ckpt"    1.0e-3) (Proxy @'(5, 16, 64, 16))
     -- accelerated grokking probe: identical to the canonical run but with 10× weight
     -- decay (the established lever that brings grokking onset earlier).  Flat lr
     -- (cosine over 500000 epochs ≈ constant 1e-3) so the transition isn't starved.
-    "p53hi" ->
-      train1 (Cfg 53 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p53hi.ckpt" 1.0e-2 seed)
-             (Proxy @'(53, 64, 256, 64))
+    "p53hi" -> train1  (mk o 53 0.5 32 500000 2000 1000 "checkpoint-p53hi.ckpt" 1.0e-2) (Proxy @'(53, 64, 256, 64))
     -- p=97 (the grokking paper's modulus) on our 1-layer/single-head architecture;
     -- ~147 batches/epoch, so slower per epoch than p53.  "p97hi" is the accelerated
     -- recipe (wd=1e-2, the lever that brings grokking onset earlier — use this to
     -- grok); plain "p97" is the canonical wd=1e-3.
-    "p97hi" ->
-      train1 (Cfg 97 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p97hi.ckpt" 1.0e-2 seed)
-             (Proxy @'(97, 64, 256, 64))
-    "p97" ->
-      train1 (Cfg 97 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p97.ckpt" 1.0e-3 seed)
-             (Proxy @'(97, 64, 256, 64))
+    "p97hi" -> train1  (mk o 97 0.5 32 500000 2000 1000 "checkpoint-p97hi.ckpt" 1.0e-2) (Proxy @'(97, 64, 256, 64))
+    "p97"   -> train1  (mk o 97 0.5 32 500000 2000 1000 "checkpoint-p97.ckpt"   1.0e-3) (Proxy @'(97, 64, 256, 64))
     -- ── two-layer variants (two stacked transformer blocks — closer to the paper) ──
-    "p5l2" ->
-      train2W (Cfg 5 1.0 25 5000 200 1.0e-3 1.0e-5 50 500 (readArg 0 2000 rest) "checkpoint-p5l2.ckpt" 1.0e-3 seed)
-              (Proxy @'(5, 16, 64, 16))
-    "p53l2" ->
-      train2W (Cfg 53 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p53l2.ckpt" 1.0e-2 seed)
-              (Proxy @'(53, 64, 256, 64))
-    "p97l2" ->
-      train2W (Cfg 97 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p97l2.ckpt" 1.0e-2 seed)
-              (Proxy @'(97, 64, 256, 64))
-    -- default / "p53": canonical run, faithful hyperparameters (wd=1e-3).
-    _ ->
-      train1 (Cfg 53 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p53.ckpt" 1.0e-3 seed)
-             (Proxy @'(53, 64, 256, 64))
-  where readArg i d xs = case drop i xs of (x : _) -> maybe d id (readMaybeInt x); _ -> d
-        readMaybeInt s = case reads s of [(x, "")] -> Just x; _ -> Nothing
+    "p5l2"  -> train2W (mk o 5  1.0 25 5000   200  2000 "checkpoint-p5l2.ckpt"  1.0e-3) (Proxy @'(5, 16, 64, 16))
+    "p53l2" -> train2W (mk o 53 0.5 32 500000 2000 1000 "checkpoint-p53l2.ckpt" 1.0e-2) (Proxy @'(53, 64, 256, 64))
+    "p97l2" -> train2W (mk o 97 0.5 32 500000 2000 1000 "checkpoint-p97l2.ckpt" 1.0e-2) (Proxy @'(97, 64, 256, 64))
+    -- default / "p53" (and any unknown mode): canonical run, faithful hyperparameters (wd=1e-3).
+    _       -> train1  (mk o 53 0.5 32 500000 2000 1000 "checkpoint-p53.ckpt"   1.0e-3) (Proxy @'(53, 64, 256, 64))
+  where
+    -- per-mode literals + the three runtime overrides → a Cfg.
+    -- (baseLR=1e-3, minLR=1e-5, and the eval/checkpoint cadence — print every 5
+    --  epochs, checkpoint every 50 — are constant across all modes, so fixed here.)
+    mk o p frac batch schedEp warmup epDef path wd =
+      Cfg p frac batch schedEp warmup 1.0e-3 1.0e-5 5 50
+          (fromMaybe epDef (optEpochs o))   -- cMaxRun
+          (fromMaybe path  (optCkpt   o))   -- cCkpt
+          wd (optSeed o)

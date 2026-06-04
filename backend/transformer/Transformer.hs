@@ -27,6 +27,7 @@ module Transformer
   ) where
 
 import Control.Monad.ST (ST)
+import Control.DeepSeq (NFData)
 import GHC.TypeNats (KnownNat, natVal)
 import Data.Proxy (Proxy(..))
 import AD (Lens, fstL, sndL, (.<))
@@ -56,7 +57,7 @@ type ParamsC v dM dF dK =
   , Additive (M v dM), Additive (M 2 dM), Additive (V v)
   , Additive (M dK dM), Additive (V dK), Additive (M dM dK), Additive (V dM)
   , Additive (M dF dM), Additive (V dF), Additive (M dM dF)
-  , Additive (Params v dM dF dK) )
+  , Additive (Params v dM dF dK), NFData (Params v dM dF dK) )
 
 -- ── layer helpers (on the tape) ───────────────────────────────────────────────
 
@@ -196,7 +197,7 @@ type ParamsC2 v dM dF dK =
   , Additive (M v dM), Additive (M 2 dM), Additive (V v)
   , Additive (M dK dM), Additive (V dK), Additive (M dM dK), Additive (V dM)
   , Additive (M dF dM), Additive (V dF), Additive (M dM dF)
-  , Additive (Params2 v dM dF dK) )
+  , Additive (Params2 v dM dF dK), NFData (Params2 v dM dF dK) )
 
 -- one transformer block applied to both positions (x0,x1) -> (y0,y1).
 blockT :: forall s p dM dF dK. (KnownNat dM, KnownNat dF, KnownNat dK)

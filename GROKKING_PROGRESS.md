@@ -284,3 +284,39 @@ transition.
 1e-3), wd=1e-2, fresh train-p53hi.log / checkpoint-p53hi.ckpt, up to 15000 epochs. (Earlier relaunch
 had log corruption from two writers; cleaned up.) Canonical (wd=1e-3, PID 209036) at epoch ~7400,
 test~3.4%, continuing slowly. Watcher bov9n6276 armed on both logs for test>10%.
+
+---
+
+## p=97 fastest-strategy run (seed 36, from zero) @ 2026-06-03
+Fastest strategy = the tape/hmatrix backend, mode `p97hi` (accelerated AdamW wd=1e-2, flat lr=1e-3,
+batch 32, split 0.5). Command: `rm -f checkpoint-p97hi.ckpt && cabal run -v0 backend-transformer-train
+-- p97hi 2000 36`. "step" = one batch gradient update; 147 batches/epoch.
+
+| epoch | steps  | train% | test% | elapsed |
+|------:|-------:|-------:|------:|--------:|
+| 100   | 14,700 | 100.0  | 98.6  | 394.2 s (~6.6 min) |
+| 200   | 29,400 | 100.0  | 100.0 | 791.6 s (~13.2 min) |
+| 300   | 44,100 | 100.0  | 100.0 | 1187.7 s |
+
+So from a fresh init, p=97 reaches **100% test in ~29,400 steps / ~13.2 min** on CPU. This is *fast
+generalization*, not delayed grokking: at split 0.5 there are 4,704 training pairs (vs 1,404 at p=53),
+so test rises almost in step with train — no long memorize-then-grok gap. Paper comparison (Power et
+al. 2022, batch 512): generalization onset ~10⁵ steps, full grok demos ~10⁶ steps; ours ~2.9×10⁴ at
+batch 32 — fewer *steps*, but each step sees 16× less data, and we're in the fast-generalization
+regime, not the delayed one (which needs a smaller train fraction).
+
+## CTC cost/benefit verdict — not worth it for this task ✗
+The Compile-to-Categories effort is concluded. CTC *works* as a mechanism (forward/loss elaboration
+through Stage 8; gradient via `ConCat.RAD.gradR`; parallel chunked training of an MLP and of softmax
+self-attention) but is **not beneficial** for this small-model/CPU grok task:
+- The full attention block (`ctc-xftrain`, d=2, 20 params) is impractical to compile: a user run
+  consumed ~all RAM + swap and ended in `Simplifier ticks exhausted ... RuleFired g . id ... Total
+  ticks 3,879,200`; the LayerNorm variant earlier hit 16 GB / 67 min. Reverse-mode of attention is the
+  wall at this concat/ghc948 pin.
+- Where CTC did compile, the parallel speedup was modest and is **plain data parallelism** (`par` over
+  chunks) — achievable on the tape backend without the plugin.
+- CTC cannot reduce the grok **step count** (an optimization property) and offers no per-step FLOP win
+  over the tape+BLAS path; its compile cost is prohibitive. Real levers for the ~1 hr (p=53) grok are a
+  GPU, fewer epochs via hyperparameters, or data-parallel batching — none of them CTC.
+Conclusion: the hand-written **Wengert-tape / hmatrix backend remains the production trainer**; CTC's
+genuine niche (large models on parallel/GPU hardware, one compile amortized) does not match this task.

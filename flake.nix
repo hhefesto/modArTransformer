@@ -270,10 +270,8 @@
           # parameter file + its logits/loss/grad; the Agda oracle reads the params
           # and writes the spec's logits/loss/grad; we tolerance-diff the streams.
           # Each per-case block is 3 logits + 1 loss + 207 grad = 211 floats.
-          # FORWARD + LOSS must match (positions 0-3 of each block); the gradient is
-          # reported but does not yet gate CI (a known Agda-side reverse-mode
-          # discrepancy under review — see CONFORMANCE.md; the Haskell gradient is
-          # independently finite-diff-verified by transformer-gradcheck).
+          # Forward, loss, and gradient must all match. Each block starts with
+          # 3 logits + 1 loss, followed by the 207-gradient stream.
           conformance = pkgs.runCommand "conformance" { } ''
             ${self'.packages.modartransformer-backend}/bin/transformer-conformance
             ${self'.packages.agda-modArConformanceOracle}/bin/agda-modArConformanceOracle
@@ -282,8 +280,9 @@
                 if(i<4){ if(d>fmax)fmax=d } else { if(d>gmax)gmax=d } }
               END{ printf "forward+loss max|d|=%g  grad max|d|=%g\n", fmax, gmax;
                    if(fmax>1e-9){ print "FORWARD/LOSS CONFORMANCE FAILED"; exit 1 }
-                   print "FORWARD+LOSS CONFORMANCE OK (Agda==Haskell to ~1e-16)" }' | tee r.txt
-            grep -q "FORWARD+LOSS CONFORMANCE OK" r.txt
+                   if(gmax>1e-9){ print "GRADIENT CONFORMANCE FAILED"; exit 1 }
+                   print "FORWARD+LOSS+GRAD CONFORMANCE OK (Agda==Haskell to ~1e-16)" }' | tee r.txt
+            grep -q "FORWARD+LOSS+GRAD CONFORMANCE OK" r.txt
             cp r.txt $out
           '';
         };

@@ -95,7 +95,7 @@ transformerLogits {p} {dModel} {dFF} {dK} tokA tokB = logits
     logits = linearLayerD ∘D (getUn ▵D o0)
 
 -- Cross-entropy loss against the target token: the morphism the trainer
--- differentiates.  `softmaxCED` is the softmax+CE primitive (Cat.VecPrim).
+-- differentiates.  Built compositionally by `crossEntropyAtD` (Cat.VecPrim).
 transformerLoss : Fin (suc p) → Fin (suc p) → Fin (suc p)
                 → D (TransformerParams p dModel dFF dK) Float
 transformerLoss tokA tokB target = crossEntropyAtD target ∘D transformerLogits tokA tokB

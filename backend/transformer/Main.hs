@@ -13,7 +13,7 @@ module Main where
 
 import Data.List (foldl')
 import Data.Maybe (fromMaybe)
-import Control.DeepSeq (NFData)
+import Control.DeepSeq (NFData, deepseq)
 import Control.Parallel.Strategies (parMap, rdeepseq, rseq, parListChunk, using)
 import qualified Options.Applicative as O
 import System.Directory (doesFileExist, renameFile)
@@ -21,6 +21,7 @@ import System.IO (hFlush, hPutStrLn, stdout, stderr)
 import System.Exit (exitFailure)
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import Text.Printf (printf)
+import Text.Read (readMaybe)
 import System.Random (StdGen, mkStdGen, randomR)
 import GHC.TypeNats (KnownNat, natVal)
 import Data.Proxy (Proxy(..))
@@ -156,22 +157,27 @@ loadCkpt nParam path = do
     contents <- readFile path
     length contents `seq` pure ()
     case lines contents of
+      [] -> bad "empty checkpoint file"
       (header : rest) -> case words header of
-        ("CHECKPOINT_ADAMW" : e : ts : b1 : b2 : _)
-          | length rest == 3 * nParam ->
-              let nums = map read rest
-                  (ps,  r1) = fromFloats nums
-                  (mm,  r2) = fromFloats r1
-                  (vv,  _)  = fromFloats r2
-                  st = AdamState (read ts) (read b1) (read b2) mm vv
-              in pure (Just (ps, st, read e))
-          | otherwise -> do
-              hPutStrLn stderr $ "loadCkpt: " ++ path ++ " is incomplete/corrupt — "
-                ++ show (length rest) ++ " floats, expected " ++ show (3 * nParam)
-                ++ " (likely an interrupted save). Delete it to start fresh."
-              exitFailure
-        _ -> pure Nothing
-      _ -> pure Nothing
+        ["CHECKPOINT_ADAMW", eS, tsS, b1S, b2S] ->
+          case (readMaybe eS, readMaybe tsS, readMaybe b1S, readMaybe b2S, traverse readMaybe rest) of
+            (Just e, Just ts, Just b1, Just b2, Just nums)
+              | length nums == 3 * nParam -> do
+                  let (ps,  r1) = fromFloats nums
+                      (mm,  r2) = fromFloats r1
+                      (vv,  _)  = fromFloats r2
+                      st = AdamState ts b1 b2 mm vv
+                  pure (Just (ps, st, e))
+              | otherwise -> bad $ "wrong float count: " ++ show (length nums)
+                  ++ ", expected " ++ show (3 * nParam)
+                  ++ " (likely an interrupted or wrong-model save)"
+            _ -> bad "non-numeric header/body field"
+        _ -> bad "unrecognized checkpoint header"
+  where
+    bad msg = do
+      hPutStrLn stderr $ "loadCkpt: " ++ path ++ " is invalid: " ++ msg
+        ++ ". Delete it to start fresh, or pass --checkpoint PATH for another file."
+      exitFailure
 
 -- ── training loop ─────────────────────────────────────────────────────────────
 
@@ -195,7 +201,7 @@ data Cfg = Cfg
 -- model-specific pieces — how to build fresh params, the batch gradient, and
 -- accuracy — are passed in, so the same loop drives both the 1-layer and 2-layer
 -- transformers (see train1 / train2W below).
-train :: forall p. (Adam p, Serialize p, Additive p, Scale p)
+train :: forall p. (Adam p, Serialize p, Additive p, Scale p, NFData p)
       => Cfg
       -> String                                    -- model description (header)
       -> (Int, Int, Int, Int)                      -- (vocab, dModel, dFF, dK) for the banner
@@ -305,7 +311,7 @@ train cfg modelDesc (vI, dMI, dFI, dKI) mkInit bgrad acc = do
                   in (pp', ss', ls + l / n)
                 avgLoss = lossSum / fromIntegral (max 1 (length batches))
             -- force params before logging / next epoch (bound memory)
-            (toFloats ps' `seq` pure ()) :: IO ()
+            ps' `deepseq` pure ()
             if epoch `mod` cEvalEv cfg == 0
               then do
                 let tr = acc ps' tr0
@@ -363,7 +369,7 @@ train2W cfg _ =
 --   -c / --checkpoint  checkpoint file (default checkpoint-<mode>.ckpt)
 --   -h / --help        auto-generated usage (lists all flags + defaults)
 data Opts = Opts
-  { optMode   :: String          -- -m / --mode        (default "p53")
+  { optMode   :: String          -- -m / --mode        (default "p97l2")
   , optEpochs :: Maybe Int       -- -e / --epochs      (Nothing → per-mode default)
   , optSeed   :: Int             -- -s / --seed        (default 42)
   , optCkpt   :: Maybe FilePath  -- -c / --checkpoint  (Nothing → checkpoint-<mode>.ckpt)
@@ -400,12 +406,15 @@ main = do
     -- grok); plain "p97" is the canonical wd=1e-3.
     "p97hi" -> train1  (mk o 97 0.5 32 500000 2000 1000 "checkpoint-p97hi.ckpt" 1.0e-2) (Proxy @'(97, 64, 256, 64))
     "p97"   -> train1  (mk o 97 0.5 32 500000 2000 1000 "checkpoint-p97.ckpt"   1.0e-3) (Proxy @'(97, 64, 256, 64))
+    "p53"   -> train1  (mk o 53 0.5 32 500000 2000 1000 "checkpoint-p53.ckpt"   1.0e-3) (Proxy @'(53, 64, 256, 64))
     -- ── two-layer variants (two stacked transformer blocks — closer to the paper) ──
     "p5l2"  -> train2W (mk o 5  1.0 25 5000   200  2000 "checkpoint-p5l2.ckpt"  1.0e-3) (Proxy @'(5, 16, 64, 16))
     "p53l2" -> train2W (mk o 53 0.5 32 500000 2000 1000 "checkpoint-p53l2.ckpt" 1.0e-2) (Proxy @'(53, 64, 256, 64))
     "p97l2" -> train2W (mk o 97 0.5 32 500000 2000 1000 "checkpoint-p97l2.ckpt" 1.0e-2) (Proxy @'(97, 64, 256, 64))
-    -- default / "p53" (and any unknown mode): canonical run, faithful hyperparameters (wd=1e-3).
-    _       -> train1  (mk o 53 0.5 32 500000 2000 1000 "checkpoint-p53.ckpt"   1.0e-3) (Proxy @'(53, 64, 256, 64))
+    badMode -> do
+      hPutStrLn stderr $ "Unknown mode: " ++ badMode
+      hPutStrLn stderr "Valid modes: p5, p53, p53hi, p97, p97hi, p5l2, p53l2, p97l2"
+      exitFailure
   where
     -- per-mode literals + the three runtime overrides → a Cfg.
     -- (baseLR=1e-3, minLR=1e-5, and the eval/checkpoint cadence — print every 5

@@ -15,6 +15,10 @@
 -- product.  Intermediate (activation) cotangents are materialised at composition,
 -- where they are small.  Still: one backward pass, gradient by the chain rule, no
 -- hand-written backward for any composite.
+--
+-- The production backend now runs the same local adjoints through Tape.hs for
+-- sharing/performance.  From this module, that runtime path uses the Lens pieces;
+-- the D/Dual definitions remain as the small categorical reference implementation.
 module AD
   ( Dual(..)
   , D(..)

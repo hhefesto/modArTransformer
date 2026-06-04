@@ -1,6 +1,6 @@
 -- Layer normalization as a single reusable D-primitive over product params.
 -- It is one mathematical operation (normalize, then scale/shift), so — like
--- `matvecD` or `softmaxCED` — it carries its own closed-form derivative; layers
+-- `matvecD` — it carries its own closed-form derivative; layers
 -- that *use* it remain pure compositions.  Params are a product (γ , β); the
 -- gradient splits into (dγ , dβ) and dx.  Forward + pullback transcribe the old
 -- LayerNorm.agda:42-64 (≡ Main.hs:141-159).
@@ -43,10 +43,9 @@ layerNormD {n} = mkD (λ p →
         let dGamma = zipWith _f*_ dOut xHat
             dBeta  = dOut
             dXHat  = zipWith _f*_ γ dOut
-            t1     = vscale invStd dXHat
-            t2     = vkonst (vsum dXHat f/ d)
-            t3     = vscale (vdot dXHat xHat f/ d) xHat
-            dX     = (t1 v- t2) v- t3
+            t1     = vkonst (vsum dXHat f/ d)
+            t2     = vscale (vdot dXHat xHat f/ d) xHat
+            dX     = vscale invStd ((dXHat v- t1) v- t2)
         in  ((dGamma , dBeta) , dX)
   in  (out , mkDual (mkAddFun pb)))
   where open import Data.Product using (proj₁; proj₂)

@@ -10,12 +10,11 @@ open import Data.List            using (List; map)
 
 -- Agda stdlib has no primFloatRead; bind Haskell's reader via FFI.
 {-# FOREIGN GHC import Text.Read (readMaybe) #-}
-{-# FOREIGN GHC import Data.Maybe (fromMaybe) #-}
 {-# FOREIGN GHC import qualified Data.Text as T #-}
 
 postulate
   parseFloat : String → Float
-{-# COMPILE GHC parseFloat = \s -> fromMaybe 0.0 (readMaybe (T.unpack s) :: Maybe Double) #-}
+{-# COMPILE GHC parseFloat = \s -> case (readMaybe (T.unpack s) :: Maybe Double) of Just x -> x; Nothing -> error ("parseFloat: invalid float: " <> T.unpack s) #-}
 
 -- One float per line.
 floatsToString : List Float → String

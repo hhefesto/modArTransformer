@@ -10,11 +10,12 @@ in-CI to the deepest (numeric) one.
 The conformance guarantee is about the **denotational model**, *not* the training
 procedure. Be precise about the boundary:
 
-- **Verified surface (what the oracle exercises):** the model — `transformerLogits` /
-  `transformerLoss` and their gradient, as a **pure function of `(params, input)`**.
+- **Verified surface (what the oracle gates):** the model's forward pass, loss, and
+  gradient — `transformerLogits`, `transformerLoss`, and `gradAndLoss` as pure functions
+  of `(params, input)`.
   `checks.conformance` feeds *shared, fixed* params from a file and compares Agda vs
   Haskell on a few `(a,b,t)` cases; it never generates data, splits, shuffles, or runs
-  the optimizer loop. Forward + loss match to ~1e-16 (below).
+  the optimizer loop. Forward, loss, and gradient now match to ~1e-16 (below).
 
 - **Out of scope (the training harness — intentionally NOT bit-faithful to the spec):**
   the surrounding *recipe* has deliberately drifted between Agda and Haskell, and
@@ -38,10 +39,11 @@ experiment — they share the model, not the trajectory.
 
 ## Guarantees in place today (all in CI via `nix flake check`)
 
-1. **The spec is well-formed** — `agda-modArTransformer-check` type-checks the whole
+1. **The spec type-checks** — `agda-modArTransformer-check` type-checks the whole
    Agda development (the enriched-category semantics in `Semantics/*`, the AD category
-   in `Cat/*`, and the layers in `Layers/*`). If the categorical/semantic construction
-   were inconsistent, this fails.
+   in `Cat/*`, and the layers in `Layers/*`). This guarantees the raw constructions are
+   accepted by Agda; semantic laws and Float interval bounds that are recorded as future
+   obligations are not thereby proved.
 
 2. **The gradient is numerically correct** — `transformer-gradcheck` (now a flake check)
    runs the backend's reverse-mode gradient against central finite differences on a tiny
@@ -73,13 +75,14 @@ experiment — they share the model, not the trajectory.
 
 ## Known, deliberate divergences (so "conformance" means "within tolerance")
 
-The Haskell loss/attention subtract a **detached max** for numerical stability;
-the Agda `Cat/VecPrim.agda` `logSumExp`/`softmax` are naive. This is **shift-invariant**:
-same value and same gradient up to floating-point rounding. So any numeric oracle must
-**tolerance-compare** (≈1e-9), not require bit-identical output. The optimizer divergence
-(item 4) is outside the model and is not part of the forward/loss/gradient conformance.
+The backend and Agda both use max-stabilized two-class attention softmax; the backend
+also uses a max-stabilized cross-entropy loss. These stabilizations are shift-invariant:
+same value and same gradient up to floating-point rounding. So the numeric oracle
+**tolerance-compares** (≈1e-9), not requiring bit-identical output. The optimizer
+divergence (item 4) is outside the model and is not part of the forward/loss/gradient
+conformance.
 
-## The deepest guarantee — BUILT: the numeric oracle (forward+loss conform to 1e-16)
+## The deepest guarantee — BUILT: the numeric oracle (forward+loss+grad conform to 1e-16)
 
 The Agda↔Haskell numeric oracle now exists and is a green flake check
 (`checks.conformance`):
@@ -96,26 +99,22 @@ The Agda↔Haskell numeric oracle now exists and is a green flake check
 
 | quantity | max \|Δ\| (Agda vs Haskell) |
 |---|---|
-| logits (forward) | **6.9e-17** |
+| logits (forward) | **1.1e-16** |
 | loss             | **1.1e-16** |
-| gradient         | 0.335 (discrepancy — see below) |
+| gradient         | **2.3e-16** |
 
-So the **forward pass and loss are numerically identical to the Agda spec to
-machine precision** — the backend provably computes the spec's model and
-objective. The check gates CI on forward+loss conformance (`max|Δ| ≤ 1e-9`).
+So the **forward pass, loss, and gradient are numerically identical to the Agda spec to
+machine precision** — the backend provably computes the spec's model, objective, and
+reverse-mode derivative on shared inputs. The check gates CI on all three streams
+(`max|Δ| ≤ 1e-9`).
 
-### Finding: the gradient diverges (the oracle did its job)
+### Finding resolved: the gradient divergence was LayerNorm
 
-Forward+loss match exactly, yet the gradient differs by ~0.33. Since the Haskell
-gradient is independently finite-difference-verified correct (`transformer-gradcheck`,
-1.6e-11), and the forward/loss are identical, this points to a discrepancy on the
-**Agda side's reverse-mode** (`Cat.Grad.gradAndLoss` through `Cat.Dual`/the layer
-pullbacks) — i.e., the spec's *stated* gradient does not match the correct gradient
-of its own (conformant) forward. This is exactly what a conformance oracle is for:
-it surfaced a real spec-vs-implementation gap in the gradient path. Reconciling it
-(audit the Agda layer pullbacks against the finite-diff-correct backend adjoints)
-is the precise next step; until then the gradient is reported by the check but does
-not gate CI.
+The oracle originally found a ~0.33 gradient delta while forward+loss matched exactly.
+The cause was the Agda `LayerNorm` pullback: the centered expression needed to be scaled
+as a whole by `invStd`. After that fix, the Agda gradient agrees with the
+finite-difference-correct backend to machine precision, and `checks.conformance` now gates
+gradient agreement too.
 
 ## (Original design notes) the numeric oracle
 
@@ -132,21 +131,22 @@ A direct Agda↔Haskell numeric check, now shown feasible by the alignment above
   via `transformerLogitsVal` / `transformerGradLoss`, emit in the same order.
 - **A flake `check`** orchestrates: run the Haskell emitter (writes params + `hs.txt`),
   run the Agda oracle (reads params, writes `agda.txt`), then tolerance-diff the two
-  float streams (`awk`, |Δ| ≤ 1e-6) — failing the build on any mismatch.
+  float streams (`awk`, |Δ| ≤ 1e-9) — failing the build on forward/loss/gradient
+  mismatch.
 
-Cost/risk: the Agda oracle is a fresh MAlonzo compile (minutes, like the existing agda
-checks), and the IO/FFI boilerplate must compile. The math/serialization are aligned, so
-the remaining work is mechanical. Once green, CI guarantees the backend's
-logits/loss/gradient match the Agda spec on shared inputs — the strongest conformance.
+Cost/risk: the Agda oracle is a fresh MAlonzo compile (minutes, like the existing Agda
+checks), and the IO/FFI boilerplate must compile. The math/serialization are aligned, and
+the current green check guarantees the backend's logits/loss/gradient match the Agda spec
+on shared inputs.
 
 ## Summary
 
 | Guarantee | Status |
 |---|---|
-| Scope: *model* verified (forward/loss/gradient as a pure fn of params+input); *training harness* out of scope | ℹ️ see "Scope of the guarantee" |
+| Scope: *model* forward/loss/gradient verified as pure fns of params+input; *training harness* out of scope | ℹ️ see "Scope of the guarantee" |
 | Agda spec type-checks | ✅ CI (`agda-modArTransformer-check`) |
 | Gradient = finite differences | ✅ CI (`transformer-gradcheck`, 1.65e-11) |
 | Parameter serialization aligned (Agda ↔ Haskell) | ✅ verified (this doc) |
 | Transliteration documented; optimizer divergence noted | ✅ |
 | Numeric oracle — forward+loss match Agda in CI (to ~1e-16) | ✅ `checks.conformance` |
-| Numeric oracle — gradient matches Agda | ✗ discrepancy found (Agda reverse-mode); reported, not gating |
+| Numeric oracle — gradient matches Agda in CI (to ~1e-16) | ✅ `checks.conformance` |

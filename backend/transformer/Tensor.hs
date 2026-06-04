@@ -8,9 +8,9 @@
 {-# LANGUAGE BangPatterns #-}
 
 -- Shape-indexed tensors backed by hmatrix (BLAS).  This is *one interpretation*
--- of the linear-map category: dense vectors/matrices over Double.  The AD layer
--- (AD.hs) is agnostic to this representation; only the primitive bodies here and
--- in Prim.hs touch hmatrix.
+-- of the linear-map category: dense vectors/matrices over Double.  The AD/tape
+-- layers are agnostic to this representation; primitive tensor operations here
+-- are the only place that touches hmatrix.
 module Tensor
   ( V(..)
   , M(..)

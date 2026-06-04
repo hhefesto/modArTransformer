@@ -68,11 +68,11 @@ The notes below are clarity / dead-code / fidelity items, not bugs.
 - **Main.hs** — training driver: Xavier init (zero bias, LN γ=1/β=0), full
   checkpoint/resume (params + Adam moments + step + b1/b2 powers + epoch), per-step
   schedule, argmax accuracy, the self-describing header + labeled columns + elapsed
-  timing, CLI `<mode> [maxEpochs] [seed]` (p5/p53/p53hi/p97/p97hi). Reads cleanly.
+  timing, flag CLI (`-m/--mode`, `-e/--epochs`, `-s/--seed`, `-c/--checkpoint`) with
+  1- and 2-layer modes. Reads cleanly.
 
 - **GradCheck.hs** — finite-difference vs `transformerGradLoss` on a tiny model; the
-  correctness gate. Good; consider promoting it to a flake `check` so the gradient
-  stays verified in CI (currently only the build is checked).
+  correctness gate. It is now wired as `checks.transformer-gradcheck`.
 
 ## Cross-cutting
 
@@ -81,12 +81,9 @@ The notes below are clarity / dead-code / fidelity items, not bugs.
   backend is a faithful transliteration of a type-checked Agda spec; reproducible
   (fixed seed, now CLI-overridable).
 - **Top recommendations (in priority order):**
-  1. **Add an Agda↔backend conformance check** (the real guarantee — Phase 3 below).
-     Today the spec is type-checked and the gradient is finite-diff-verified, but
-     nothing proves the Haskell numerics match the Agda numerics. This is the most
-     valuable missing test.
-  2. Promote `transformer-gradcheck` to a flake `check`.
-  3. Decide AD.hs's fate (mark-as-reference vs extract `Lens`).
-  4. (Optional) O(n) shuffle if it ever matters.
+  1. Decide AD.hs's fate (mark-as-reference vs extract `Lens`).
+  2. Keep the seed-preserving shuffle unless a measured performance need justifies changing the
+     split trajectory.
+  3. Keep `checks.conformance` gating forward/loss/gradient so Agda and backend stay aligned.
 - **No security/footgun issues** for a research trainer (file I/O is the checkpoint
   only; no network, no unsafe).

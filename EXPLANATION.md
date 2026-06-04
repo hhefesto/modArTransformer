@@ -156,16 +156,14 @@ The math is identical to the categorical version — the tape just *sequences* t
 
 Today:
 - The Agda spec **type-checks** (a CI gate), so the categorical/semantic construction is
-  well-formed.
+  syntactically well-formed. Semantic laws are documented obligations rather than fully proved
+  invariants for the Float-valued learned model.
 - The Haskell gradient is **finite-difference-verified** (`transformer-gradcheck`, max abs err
   1.6e-11) — the tape's adjoints are numerically correct.
 - The Haskell `Transformer.hs` is a documented **transliteration** of `Layers/Transformer.agda`.
-
-Not yet (the missing guarantee, in progress): an **Agda↔Haskell conformance oracle** that
-MAlonzo-evaluates the Agda spec and the Haskell backend on identical parameters/inputs and
-checks that logits, loss, and gradient agree within tolerance. That is the next deliverable
-(it will tolerance-compare, since the max-subtraction stability tweak is shift-invariant but
-not bit-identical). Once green as a flake check, the backend is *guaranteed* to track the spec.
+- The **Agda↔Haskell conformance oracle** is a CI gate for forward+loss+gradient: it
+  MAlonzo-evaluates the Agda spec and the Haskell backend on identical parameters/inputs and shows
+  logits/loss/gradient agree to machine precision.
 
 ---
 
@@ -176,5 +174,5 @@ not bit-identical). Once green as a flake check, the backend is *guaranteed* to 
 Dirac ground-truth meaning (Bradley). Its gradient is the transpose of the forward morphism in
 `Dual AddFun`, derived by the chain rule with no hand-written backward (Elliott). Both are a
 type-checked Agda spec; the Haskell trainer realizes the *same* adjoints on a Wengert tape so
-each node is visited once (≈27× faster than the point-free form), and a conformance oracle is
-being added so the fast path is provably faithful to the spec."
+each node is visited once (≈27× faster than the point-free form), and a conformance oracle now
+gates forward+loss+gradient agreement with the spec."

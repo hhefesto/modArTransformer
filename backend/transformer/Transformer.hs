@@ -118,8 +118,11 @@ forwardT tp tokA tokB p = do
   d1 <- tVdot tp q0 k1
   score0 <- tScaleC tp sc d0
   score1 <- tScaleC tp sc d1
-  es0 <- tExp tp score0
-  es1 <- tExp tp score1
+  let sm = max (primalR score0) (primalR score1)
+  score0' <- tAddC tp (negate sm) score0
+  score1' <- tAddC tp (negate sm) score1
+  es0 <- tExp tp score0'
+  es1 <- tExp tp score1'
   z   <- tAdd tp es0 es1
   rz  <- tRecip tp z
   w0  <- tMul tp es0 rz
@@ -231,8 +234,11 @@ blockT tp p lAttn lLn1 lFfn lLn2 sc x0 x1 = do
         d1 <- tVdot tp q k1
         s0 <- tScaleC tp sc d0
         s1 <- tScaleC tp sc d1
-        e0' <- tExp tp s0
-        e1' <- tExp tp s1
+        let sm = max (primalR s0) (primalR s1)
+        s0' <- tAddC tp (negate sm) s0
+        s1' <- tAddC tp (negate sm) s1
+        e0' <- tExp tp s0'
+        e1' <- tExp tp s1'
         z   <- tAdd tp e0' e1'
         rz  <- tRecip tp z
         w0  <- tMul tp e0' rz

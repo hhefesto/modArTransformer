@@ -16,14 +16,11 @@ Plan file: `~/.claude/plans/read-opencode-s-latest-plan-quizzical-valley.md`
 - [x] Phase 2 — Fast Cont/Dual transformer forward pass (hmatrix-backed)
 - [x] Phase 3 — AdamW + per-step schedule + full checkpoint (from recovered Main.hs)
 - [~] Phase 4 — Verification ladder (grad check ✓, p=5 overfit ✓, p=53 timing ~, grokking pending)
-- [~] Phase 5 — CTC compilation: plugin DE-RISKED (forward/loss Stages 0-8 elaborate, no Double#
-      panic); GRADIENT via toCcc CRACKED via ConCat.RAD.gradR (reverse-mode Dual AdditiveFun),
-      a flake check; PARALLEL CTC TRAINING demonstrated end-to-end — ctc-train (line fit) +
-      ctc-partrain (2→2→2 net learns (a+b) mod 2 via par-evaluated gradR chunk gradients).
-      Remaining: full-dim transformer through CTC is blocked by ConCat's fragile Vector path
-      (Conal's own Vector net tests are commented out as failing) — tape backend stays the
-      full-scale trainer.
-- [ ] Phase 6 — Agda conformance oracle
+- [x] Phase 5 — CTC compilation explored and concluded: forward/loss and small gradR demos worked,
+      but full transformer reverse-mode CTC was not practical at this pin; the tape backend remains
+      the full-scale trainer.
+- [x] Phase 6 — Agda conformance oracle built: forward+loss+gradient match to machine precision
+      and gate CI.
 
 ## Decisions (from planning session)
 - CTC is the acceptance gate; resolve Double# via NumCat morphisms (Conal-style).
@@ -112,11 +109,9 @@ historically. The wd=1e-3 vs wd=1e-2 contrast cleanly shows weight decay as the 
 (consistent with the historical note "99% test required wd=1e-3").
 
 ### Remaining plan items (not part of the grokking goal; for when you're back)
-- Phase 5: CTC acceptance gate — route the forward pass through `toCcc`. Plugin DE-RISKED through
-  fixed linear, softmax, NLL, tiny MLP-loss, tiny attention, and tiny block-loss fragments (see
-  below); next is larger transformer block fragments, then a parallel-category interpretation and/or a `toCcc`-able
-  categorical forwardT.
-- Phase 6: Agda conformance oracle — diff MAlonzo-evaluated Agda logits/loss against the backend.
+- Phase 5: CTC acceptance gate — completed as a research branch; useful at tiny tuple-shaped scale,
+  not the production trainer.
+- Phase 6: Agda conformance oracle — built; forward+loss+gradient gate CI.
 - Optional: let the canonical wd=1e-3 run continue toward the exact historical ~66k-epoch grokking.
 
 ### Phase 5 — CTC plugin de-risk: VIABLE (no Double# panic) ★
@@ -137,10 +132,8 @@ Verdict: **the anticipated `Double#` panic does NOT occur** at the current pin �
 the flake input (overlaid on **ghc948**, `dontCheck concat-plugin`, `flake.nix:127-141`) elaborates
 scalar, linear-kernel, softmax, NLL, tiny MLP-loss, tiny attention, and tiny block-loss `Double`
 arithmetic with only `-fplugin=ConCat.Plugin` (no extra reboxing flags needed). Reproduce:
-`nix -Lv build .#ctc-smoke --no-link && nix -Lv run .#ctc-smoke`; flake check:
-`nix -Lv build .#checks.x86_64-linux.ctc-smoke --no-link`. Source: `ctc-smoke/Main.hs`. This clears
-the largest schedule risk; the literal `toCcc` path is open for larger transformer block fragments →
-full forwardT.
+Historical reproduction commands used `ctc-smoke`, but those packages were removed during later
+consolidation. This result remains a provenance note, not an active flake target.
 
 ### CTC GRADIENT — CRACKED ★ (gradient via toCcc now compiles + is a flake check)
 The gradient blocker is resolved. Root cause was **representation-specific**: `ConCat.AD.gradient`
@@ -155,9 +148,8 @@ via `RAD = GD (Dual (-+>))` (`Dual AdditiveFun`), the path ConCat's own `BasicTe
 (`-funfolding-case-threshold=1`, `-funfolding-case-scaling=5`) and added `-fexpose-all-unfoldings`
 (ConCat's documented requirement); `-fsimpl-tick-factor=2000 -freduction-depth=0` suffice.
 
-Result: `gradR (\(x,y) -> x*x + y*y)` compiles cleanly and `(3,4) -> (6.0,8.0)` (exact). Reproduce:
-`nix build .#ctc-grad-smoke && nix run .#ctc-grad-smoke`. Now a flake check
-(`checks.x86_64-linux.ctc-grad-smoke`, green). Source: `ctc-grad-smoke/Main.hs`.
+Result at the time: `gradR (\(x,y) -> x*x + y*y)` compiled cleanly and `(3,4) -> (6.0,8.0)`
+(exact). The `ctc-grad-smoke` package/check was later removed during consolidation.
 
 Significance: this is the gate for CTC *training* — gradients now flow through `toCcc`, no
 hand-written backward, the Conal way.
@@ -171,7 +163,7 @@ End-to-end training driven by Compile-to-Categories gradients now works, in two 
   Two CTC axes: (1) each data chunk's gradient is `gradR (toCcc chunkLoss)`; (2) the batch gradient
   is the two chunk gradients summed, evaluated **in parallel** via `par`/`pseq` (`+RTS -N`).
   Result: loss `0.1674 → 0.000468`, all 4 cases correct, `seq=1.18s par=1.09s` (matching
-  checksums). Reproduce: `nix run .#ctc-train` / `nix run .#ctc-partrain`.
+  checksums). These demo packages were later removed during consolidation.
 
 Caveats (honest scope):
 - The parallel speedup is modest because the model is tiny (overhead ≈ work) — the same scale
@@ -194,8 +186,8 @@ position-0 query attends over two token embeddings (which serve directly as Q/K/
 readout gives class logits, squared-error loss. Gradient = `gradR (toCcc chunk)` (reverse mode,
 no hand-written backward); batch gradient = chunk1+chunk2 with the compiled chunks run in parallel
 via `par`/`pseq`. It **compiles** (~20 min, RSS ~1.8 GB bounded) and **trains**: on `(a+b) mod 2`,
-loss `3.57 → 1.33`, **3/4 correct**, `par 21.6s < seq 23.6s` (matching checksums). Run:
-`nix run .#ctc-attntrain`.
+loss `3.57 → 1.33`, **3/4 correct**, `par 21.6s < seq 23.6s` (matching checksums). The demo package
+was later removed during consolidation.
 
 So attention IS trainable via parallel CTC. The 4th case is a capacity limit of this deliberately
 minimal 12-param model (Q=K=V=embeddings, no projections/biases) — a local min, not a CTC failure;
@@ -289,8 +281,9 @@ test~3.4%, continuing slowly. Watcher bov9n6276 armed on both logs for test>10%.
 
 ## p=97 fastest-strategy run (seed 36, from zero) @ 2026-06-03
 Fastest strategy = the tape/hmatrix backend, mode `p97hi` (accelerated AdamW wd=1e-2, flat lr=1e-3,
-batch 32, split 0.5). Command: `rm -f checkpoint-p97hi.ckpt && cabal run -v0 backend-transformer-train
--- p97hi 2000 36`. "step" = one batch gradient update; 147 batches/epoch.
+batch 32, split 0.5). Current flag-CLI command: `rm -f checkpoint-p97hi.ckpt && cabal run -v0
+backend-transformer-train -- -m p97hi -e 2000 -s 36`. "step" = one batch gradient update; 147
+batches/epoch.
 
 | epoch | steps  | train% | test% | elapsed |
 |------:|-------:|-------:|------:|--------:|
@@ -337,6 +330,6 @@ Findings: both reach high test at the **same step count** (29,400 = epoch 200), 
 takes ~2.25× the wall-clock (more params, both positions through two blocks). The 2-layer's curve is
 **more gradual / paper-like**: 39.4% test at epoch 100 (vs the 1-layer's 98.6%) then a sharper climb
 to 99.7% by epoch 200 — extra depth delays generalization in epochs even though the step-count to
-grok matches here. Reproduce: `cabal run -v0 backend-transformer-train -- p97l2 2000 36`
+grok matches here. Reproduce: `cabal run -v0 backend-transformer-train -- -m p97l2 -e 2000 -s 36`
 (also `p53l2`, `p5l2`). Validated end-to-end (p5l2 overfits to 100% train; gradient correct by
 construction + the 1-layer gradcheck shares the same tape primitives).

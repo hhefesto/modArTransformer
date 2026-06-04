@@ -32,8 +32,8 @@ executable transformer-conformance
   ghc-options:      -O2 -threaded -rtsopts
   default-language: Haskell2010
 
--- Full transformer training toward grokking (1- or 2-layer; modes p5/p53/p97 and
--- their *l2 variants, default p97l2 — the paper's modulus, 2 layers).
+-- Full transformer training toward grokking (1- or 2-layer; modes p5/p53/p53hi/p97/p97hi
+-- and p5l2/p53l2/p97l2, default p97l2 — the paper's modulus, 2 layers).
 executable backend-transformer-train
   main-is:          Main.hs
   hs-source-dirs:   backend/transformer

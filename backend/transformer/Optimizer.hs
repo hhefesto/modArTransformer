@@ -7,8 +7,8 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RecordWildCards #-}
 
--- AdamW, warmup+cosine schedule (per global batch step), checkpoint I/O, Xavier
--- init, data generation/split/shuffle, accuracy.  Transcribed from the recovered
+-- AdamW, warmup+cosine schedule (per global batch step), plus data generation,
+-- split, and shuffle.  Transcribed from the recovered
 -- grokking-success Main.hs @ 62b0b4d (NOT the Agda Adamable/Schedule, whose
 -- eps-placement and warmup curve differ).  Weight decay applies to matrices only.
 module Optimizer
@@ -119,6 +119,7 @@ generateData :: Int -> [(Int, Int, Int)]
 generateData p = [ (a, b, (a + b) `mod` p) | a <- [0 .. p - 1], b <- [0 .. p - 1] ]
 
 chunksOf :: Int -> [a] -> [[a]]
+chunksOf k _ | k <= 0 = error "chunksOf: chunk size must be positive"
 chunksOf _ [] = []
 chunksOf k xs = let (h, t) = splitAt k xs in h : chunksOf k t
 

@@ -46,3 +46,8 @@ purescript/.pulp-cache/
 purescript/.psc-package/
 purescript/.spago/
 purescript/output/
+
+# conformance oracle run artifacts
+conformance-params.txt
+conformance-hs.txt
+conformance-agda.txt

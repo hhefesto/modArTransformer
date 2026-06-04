@@ -56,6 +56,34 @@ initFlat v dM dF dK g0 =
       flat = tok ++ pos ++ wq ++ wk ++ wv ++ wo ++ ln1 ++ up ++ dn ++ ln2 ++ un
   in (flat, g9)
 
+-- Flat parameter list in the exact Serialize leaf order for Params2 (two stacked
+-- blocks): tok, pos, block1, block2, unembed; each block = Wq,Wk,Wv,Wo, LN1, FFN
+-- up, FFN down, LN2.
+initFlat2 :: Int -> Int -> Int -> Int -> StdGen -> ([Double], StdGen)
+initFlat2 v dM dF dK g0 =
+  let xav r c = sqrt (6 / fromIntegral (r + c))
+      mblock r c g = uniformN (r * c) (xav r c) g
+      zeros k = replicate k 0
+      ones  k = replicate k 1
+      lin o i g = let (w, g') = mblock o i g in (w ++ zeros o, g')
+      block g =                                            -- one transformer block
+        let (wq, g1) = lin dK dM g
+            (wk, g2) = lin dK dM g1
+            (wv, g3) = lin dK dM g2
+            (wo, g4) = lin dM dK g3
+            ln1      = ones dM ++ zeros dM
+            (up, g5) = lin dF dM g4
+            (dn, g6) = lin dM dF g5
+            ln2      = ones dM ++ zeros dM
+        in (wq ++ wk ++ wv ++ wo ++ ln1 ++ up ++ dn ++ ln2, g6)
+      (tok,  g1) = mblock v dM g0
+      (pos,  g2) = mblock 2 dM g1
+      (blk1, g3) = block g2
+      (blk2, g4) = block g3
+      (un,   g5) = lin v dM g4
+      flat = tok ++ pos ++ blk1 ++ blk2 ++ un
+  in (flat, g5)
+
 -- ── accuracy ────────────────────────────────────────────────────────────────────
 
 argmaxList :: [Double] -> Int
@@ -127,9 +155,19 @@ data Cfg = Cfg
   , cSeed     :: Int      -- RNG seed: data split + Xavier init + per-epoch shuffle
   }
 
-train :: forall v dM dF dK. (ParamsC v dM dF dK, Adam (Params v dM dF dK), Serialize (Params v dM dF dK))
-      => Cfg -> Proxy '(v, dM, dF, dK) -> IO ()
-train cfg _ = do
+-- Generic training loop, polymorphic over the parameter type `p`.  The
+-- model-specific pieces — how to build fresh params, the batch gradient, and
+-- accuracy — are passed in, so the same loop drives both the 1-layer and 2-layer
+-- transformers (see train1 / train2W below).
+train :: forall p. (Adam p, Serialize p, Additive p, Scale p)
+      => Cfg
+      -> String                                    -- model description (header)
+      -> (Int, Int, Int, Int)                      -- (vocab, dModel, dFF, dK) for the banner
+      -> (StdGen -> p)                             -- build fresh params from the seed gen
+      -> (p -> [(Int, Int, Int)] -> (p, Double))   -- batch gradient + summed loss
+      -> (p -> [(Int, Int, Int)] -> Double)        -- accuracy on a dataset
+      -> IO ()
+train cfg modelDesc (vI, dMI, dFI, dKI) mkInit bgrad acc = do
   let p   = cP cfg
       g0  = mkStdGen (cSeed cfg)
       adamCfg = AdamConfig 0.9 0.999 1.0e-8 (cWD cfg)
@@ -137,20 +175,14 @@ train cfg _ = do
       (tr0, te0, _) = splitData (cFrac cfg) g0 allData
       batchesPer = length (chunksOf (cBatch cfg) tr0)
       totalSteps = cSchedEp cfg * max 1 batchesPer
-      vI = fromIntegral (natVal (Proxy @v)) :: Int
-      dMI = fromIntegral (natVal (Proxy @dM)) :: Int
-      dFI = fromIntegral (natVal (Proxy @dF)) :: Int
-      dKI = fromIntegral (natVal (Proxy @dK)) :: Int
   loaded <- loadCkpt (cCkpt cfg)
   (params0, st0, startEpoch) <- case loaded of
     Just (ps, st, e) -> do
       printf "Resumed %s at epoch %d (step %d)\n" (cCkpt cfg) e (asT st)
       pure (ps, st, e + 1)
     Nothing -> do
-      let (flat, _) = initFlat vI dMI dFI dKI g0
-          ps = fst (fromFloats flat) :: Params v dM dF dK
       printf "Fresh init (Xavier).\n"
-      pure (ps, initAdam, 1)
+      pure (mkInit g0, initAdam, 1)
   -- ── detailed run header: what is being trained, how, and why it matters ──────
   let p2     = p * p
       nParam = length (toFloats params0)
@@ -167,8 +199,8 @@ train cfg _ = do
   printf "        Train acc -> ~100%% within a few hundred epochs (memorization) while\n"
   printf "        test acc stays near chance (~%.1f%%) far longer, then jumps sharply once\n" chance
   printf "        weight decay drives the net onto a generalizing circuit.  Watch test%%.\n"
-  printf " Model: 1-layer single-head transformer, seqLen=2, readout at position 0.\n"
-  printf "        dModel=%d  dFF=%d  dK=%d  vocab=%d  |  %d parameters.\n" dMI dFI dKI p nParam
+  printf " Model: %s\n" modelDesc
+  printf "        dModel=%d  dFF=%d  dK=%d  vocab=%d  |  %d parameters.\n" dMI dFI dKI vI nParam
   printf " AD   : gradient = ONE reverse pass of Conal Elliott's AD-as-categories\n"
   printf "        (Wengert tape, Tape.hs); no hand-written backward.  Loss = cross-\n"
   printf "        entropy (softmax as a [0,1]-enriched copresheaf; relative entropy to\n"
@@ -215,13 +247,18 @@ train cfg _ = do
       loop !epoch !ps !st !g
         | epoch > lastEpoch = do
             saveCkpt (cCkpt cfg) ps st (epoch - 1)
-            printf "Stopped after epoch %d (checkpoint saved).\n" (epoch - 1)
+            tEnd <- getCurrentTime
+            let secs = realToFrac (diffUTCTime tEnd t0) :: Double
+                epochsRun = epoch - startEpoch
+            printf "Stopped after epoch %d | %d steps | %.1fs total" (epoch - 1) (asT st) secs
+            printf " (%.3f s/epoch over %d epochs this run); checkpoint saved.\n"
+              (if epochsRun > 0 then secs / fromIntegral epochsRun else 0) (max 0 epochsRun)
         | otherwise = do
             let (shuf, g') = shuffle g tr0
                 batches = chunksOf (cBatch cfg) shuf
                 (ps', st', lossSum) = foldl' batchStep (ps, st, 0) batches
                 batchStep (!pp, !ss, !ls) batch =
-                  let (gAvgRaw, l) = batchGradLoss pp batch
+                  let (gAvgRaw, l) = bgrad pp batch
                       n = fromIntegral (length batch)
                       gAvg = scaleA (1 / n) gAvgRaw
                       step = asT ss + 1
@@ -233,8 +270,8 @@ train cfg _ = do
             (toFloats ps' `seq` pure ()) :: IO ()
             if epoch `mod` cEvalEv cfg == 0
               then do
-                let tr = accuracy ps' tr0
-                    te = accuracy ps' te0
+                let tr = acc ps' tr0
+                    te = acc ps' te0
                     lrNow = lrWarmupCosine (cWarmup cfg) totalSteps (cBaseLR cfg) (cMinLR cfg) (asT st')
                 now <- getCurrentTime
                 let elapsed = realToFrac (diffUTCTime now t0) :: Double
@@ -249,10 +286,46 @@ train cfg _ = do
 
   loop startEpoch params0 st0 gE
 
+-- ── model wrappers (supply the model-specific pieces to the generic loop) ───────
+
+train1 :: forall v dM dF dK.
+          (ParamsC v dM dF dK, Adam (Params v dM dF dK), Serialize (Params v dM dF dK), Scale (Params v dM dF dK))
+       => Cfg -> Proxy '(v, dM, dF, dK) -> IO ()
+train1 cfg _ =
+  train cfg "1-layer single-head transformer, seqLen=2, readout at position 0"
+        (vI, dMI, dFI, dKI) mkInit batchGradLoss accuracy
+  where vI  = fromIntegral (natVal (Proxy @v))  :: Int
+        dMI = fromIntegral (natVal (Proxy @dM)) :: Int
+        dFI = fromIntegral (natVal (Proxy @dF)) :: Int
+        dKI = fromIntegral (natVal (Proxy @dK)) :: Int
+        mkInit g = fst (fromFloats (fst (initFlat vI dMI dFI dKI g))) :: Params v dM dF dK
+
+train2W :: forall v dM dF dK.
+           (ParamsC2 v dM dF dK, Adam (Params2 v dM dF dK), Serialize (Params2 v dM dF dK), Scale (Params2 v dM dF dK))
+        => Cfg -> Proxy '(v, dM, dF, dK) -> IO ()
+train2W cfg _ =
+  train cfg "2-layer transformer (two stacked single-head blocks), seqLen=2, readout at position 0"
+        (vI, dMI, dFI, dKI) mkInit bgrad acc
+  where vI  = fromIntegral (natVal (Proxy @v))  :: Int
+        dMI = fromIntegral (natVal (Proxy @dM)) :: Int
+        dFI = fromIntegral (natVal (Proxy @dF)) :: Int
+        dKI = fromIntegral (natVal (Proxy @dK)) :: Int
+        mkInit g = fst (fromFloats (fst (initFlat2 vI dMI dFI dKI g))) :: Params2 v dM dF dK
+        bgrad ps = foldl' step (zeroA, 0)
+          where step (!gA, !lA) (a, b, t) =
+                  let (g, l) = transformerGradLoss2 a b t ps in (addA gA g, lA + l)
+        acc _  [] = 0
+        acc ps xs =
+          let correct = length [ () | (a, b, t) <- xs
+                                    , argmaxList (vtoList (transformerLogitsVal2 a b ps)) == t ]
+          in fromIntegral correct / fromIntegral (length xs)
+
 -- ── entry ───────────────────────────────────────────────────────────────────────
 
 -- Usage: backend-transformer-train [MODE] [MAX_EPOCHS] [SEED]
---   MODE       p5 | p53 | p53hi | p97 | p97hi   (default p53)
+--   MODE       p5 | p53 | p53hi | p97 | p97hi        (1-layer)
+--              p5l2 | p53l2 | p97l2                  (2-layer — like the paper)
+--              (default p53)
 --   MAX_EPOCHS epochs to run THIS invocation (resumes from checkpoint)
 --   SEED       RNG seed for split/init/shuffle (default 42; vary for non-identical runs)
 main :: IO ()
@@ -262,27 +335,37 @@ main = do
       seed = readArg 1 42 rest
   case mode of
     "p5" ->
-      train (Cfg 5 1.0 25 5000 200 1.0e-3 1.0e-5 50 500 (readArg 0 2000 rest) "checkpoint-p5.ckpt" 1.0e-3 seed)
-            (Proxy @'(5, 16, 64, 16))
+      train1 (Cfg 5 1.0 25 5000 200 1.0e-3 1.0e-5 50 500 (readArg 0 2000 rest) "checkpoint-p5.ckpt" 1.0e-3 seed)
+             (Proxy @'(5, 16, 64, 16))
     -- accelerated grokking probe: identical to the canonical run but with 10× weight
     -- decay (the established lever that brings grokking onset earlier).  Flat lr
     -- (cosine over 500000 epochs ≈ constant 1e-3) so the transition isn't starved.
     "p53hi" ->
-      train (Cfg 53 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p53hi.ckpt" 1.0e-2 seed)
-            (Proxy @'(53, 64, 256, 64))
+      train1 (Cfg 53 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p53hi.ckpt" 1.0e-2 seed)
+             (Proxy @'(53, 64, 256, 64))
     -- p=97 (the grokking paper's modulus) on our 1-layer/single-head architecture;
     -- ~147 batches/epoch, so slower per epoch than p53.  "p97hi" is the accelerated
     -- recipe (wd=1e-2, the lever that brings grokking onset earlier — use this to
     -- grok); plain "p97" is the canonical wd=1e-3.
     "p97hi" ->
-      train (Cfg 97 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p97hi.ckpt" 1.0e-2 seed)
-            (Proxy @'(97, 64, 256, 64))
+      train1 (Cfg 97 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p97hi.ckpt" 1.0e-2 seed)
+             (Proxy @'(97, 64, 256, 64))
     "p97" ->
-      train (Cfg 97 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p97.ckpt" 1.0e-3 seed)
-            (Proxy @'(97, 64, 256, 64))
+      train1 (Cfg 97 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p97.ckpt" 1.0e-3 seed)
+             (Proxy @'(97, 64, 256, 64))
+    -- ── two-layer variants (two stacked transformer blocks — closer to the paper) ──
+    "p5l2" ->
+      train2W (Cfg 5 1.0 25 5000 200 1.0e-3 1.0e-5 50 500 (readArg 0 2000 rest) "checkpoint-p5l2.ckpt" 1.0e-3 seed)
+              (Proxy @'(5, 16, 64, 16))
+    "p53l2" ->
+      train2W (Cfg 53 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p53l2.ckpt" 1.0e-2 seed)
+              (Proxy @'(53, 64, 256, 64))
+    "p97l2" ->
+      train2W (Cfg 97 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p97l2.ckpt" 1.0e-2 seed)
+              (Proxy @'(97, 64, 256, 64))
     -- default / "p53": canonical run, faithful hyperparameters (wd=1e-3).
     _ ->
-      train (Cfg 53 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p53.ckpt" 1.0e-3 seed)
-            (Proxy @'(53, 64, 256, 64))
+      train1 (Cfg 53 0.5 32 500000 2000 1.0e-3 1.0e-5 100 1000 (readArg 0 1000 rest) "checkpoint-p53.ckpt" 1.0e-3 seed)
+             (Proxy @'(53, 64, 256, 64))
   where readArg i d xs = case drop i xs of (x : _) -> maybe d id (readMaybeInt x); _ -> d
         readMaybeInt s = case reads s of [(x, "")] -> Just x; _ -> Nothing

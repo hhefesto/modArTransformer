@@ -219,6 +219,15 @@
 
         checks = {
           inherit (self'.packages) agda-modArTransformer agda-modArTransformer-check agda-modArTensorDiagnostics modartransformer-backend;
+
+          # Run the finite-difference gradient check at build time: guarantees the
+          # backend's reverse-mode gradient matches numerical differences (the tape
+          # adjoints are correct) on every CI build, not just that it compiles.
+          transformer-gradcheck = pkgs.runCommand "transformer-gradcheck" { } ''
+            ${self'.packages.modartransformer-backend}/bin/transformer-gradcheck | tee result.txt
+            grep -q "GRADCHECK PASSED" result.txt
+            cp result.txt $out
+          '';
         };
       };
     };

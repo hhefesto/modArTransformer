@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<!--
+  Presentation diagram for the denotational modular-arithmetic transformer.
+  Standalone (open this file in a browser — no build).  The interactive Reflex
+  port lives in ../frontend (build via reflex-platform); this static SVG is the
+  immediately-presentable artifact and the visual the Reflex port reproduces.
+
+  It shows the two pillars at once:
+    • Tai-Danae Bradley — meaning: softmax output IS the copresheaf π(·|ctx);
+      loss = relative entropy to the Dirac ground-truth meaning.
+    • Conal Elliott — gradient: the backward pass is the TRANSPOSE of the forward
+      morphism in Dual AddFun (no hand-written backward), run as a Wengert tape.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Denotational Modular-Arithmetic Transformer</title>
+<style>
+  :root{ --bg:#0b1020; --panel:#0f1830; --ink:#e8eefc; --dim:#9fb0d0;
+         --fwd:#42c9ff; --bwd:#ff9f43; --tdb:#c792ea; --ce:#7ee787; --edge:#26344f; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:18px 24px;border-bottom:1px solid var(--edge)}
+  header h1{margin:0 0 4px;font-size:20px}
+  header p{margin:0;color:var(--dim)}
+  .wrap{display:flex;gap:18px;padding:18px 24px;flex-wrap:wrap}
+  .col{flex:1 1 520px;min-width:360px}
+  svg{width:100%;height:auto;background:var(--panel);border:1px solid var(--edge);border-radius:10px}
+  .card{background:var(--panel);border:1px solid var(--edge);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+  .card h2{margin:0 0 8px;font-size:15px}
+  .tdb{color:var(--tdb)} .conal{color:var(--fwd)} .ce{color:var(--ce)}
+  code{background:#0a1226;border:1px solid var(--edge);border-radius:5px;padding:1px 5px;color:#cfe3ff}
+  .muted{color:var(--dim)}
+  ul{margin:6px 0 0;padding-left:18px} li{margin:3px 0}
+  .legend span{display:inline-flex;align-items:center;gap:6px;margin-right:16px}
+  .swatch{width:14px;height:3px;display:inline-block;border-radius:2px}
+  footer{padding:10px 24px;color:var(--dim);border-top:1px solid var(--edge);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Denotational Modular-Arithmetic Transformer — <span class="tdb">meaning</span> ∘ <span class="conal">gradient</span></h1>
+  <p>Learns <code>(a + b) mod p</code>. Meaning = Tai-Danae Bradley's [0,1]-enriched-category semantics · Gradient = Conal Elliott's AD-as-categories, run on a Wengert tape.</p>
+</header>
+
+<div class="wrap">
+  <div class="col">
+    <svg viewBox="0 0 560 760" role="img" aria-label="architecture diagram">
+      <defs>
+        <marker id="fwd" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="#42c9ff"/></marker>
+        <marker id="bwd" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="#ff9f43"/></marker>
+      </defs>
+
+      <!-- forward spine -->
+      <g font-family="inherit">
+        <!-- input -->
+        <text x="150" y="30" fill="#9fb0d0" font-size="13">inputs  a, b ∈ ℤ/p</text>
+
+        <!-- Embedding -->
+        <rect x="120" y="44" width="320" height="58" rx="8" fill="#0d1a2a" stroke="#42c9ff"/>
+        <text x="280" y="68" fill="#e8eefc" font-size="14" text-anchor="middle">Embedding</text>
+        <text x="280" y="86" fill="#9fb0d0" font-size="12" text-anchor="middle">token + position lookup → ℝ²ˣ⁶⁴</text>
+
+        <!-- Attention -->
+        <rect x="120" y="132" width="320" height="74" rx="8" fill="#16122a" stroke="#c792ea"/>
+        <text x="280" y="156" fill="#e8eefc" font-size="14" text-anchor="middle">Self-Attention (single head)</text>
+        <text x="280" y="174" fill="#9fb0d0" font-size="12" text-anchor="middle">Q·Kᵀ → softmax → ·V → Wₒ ; both positions</text>
+        <text x="280" y="192" fill="#9fb0d0" font-size="12" text-anchor="middle">+ residual</text>
+
+        <!-- LayerNorm -->
+        <rect x="120" y="236" width="320" height="40" rx="8" fill="#0d1a2a" stroke="#3a4a6a"/>
+        <text x="280" y="261" fill="#cfe3ff" font-size="13" text-anchor="middle">LayerNorm</text>
+
+        <!-- FFN -->
+        <rect x="120" y="306" width="320" height="58" rx="8" fill="#1a1410" stroke="#ff9f43"/>
+        <text x="280" y="330" fill="#e8eefc" font-size="14" text-anchor="middle">FFN  64 → 256 → ReLU → 64</text>
+        <text x="280" y="348" fill="#9fb0d0" font-size="12" text-anchor="middle">+ residual → LayerNorm</text>
+
+        <text x="280" y="392" fill="#9fb0d0" font-size="12" text-anchor="middle">⟲ stack ×N layers (N=1 or 2; the paper used 2)</text>
+
+        <!-- Unembed -->
+        <rect x="120" y="408" width="320" height="44" rx="8" fill="#0d1a2a" stroke="#42c9ff"/>
+        <text x="280" y="435" fill="#e8eefc" font-size="13" text-anchor="middle">Unembed (position 0)  ℝ⁶⁴ → ℝᵖ</text>
+
+        <!-- softmax = copresheaf -->
+        <rect x="95" y="482" width="370" height="64" rx="8" fill="#16122a" stroke="#c792ea"/>
+        <text x="280" y="506" fill="#c792ea" font-size="14" text-anchor="middle">softmax  =  π(· | [a,b])</text>
+        <text x="280" y="524" fill="#9fb0d0" font-size="12" text-anchor="middle">a [0,1]-enriched copresheaf — the *meaning* of the context</text>
+        <text x="280" y="539" fill="#9fb0d0" font-size="11" text-anchor="middle">(Bradley: representable hˣ = L(x,−))</text>
+
+        <!-- loss -->
+        <rect x="95" y="576" width="370" height="64" rx="8" fill="#0f1f12" stroke="#7ee787"/>
+        <text x="280" y="600" fill="#7ee787" font-size="14" text-anchor="middle">loss = relative entropy( π ‖ δ )</text>
+        <text x="280" y="618" fill="#9fb0d0" font-size="12" text-anchor="middle">to the Dirac truth δ at (a+b) mod p</text>
+        <text x="280" y="633" fill="#9fb0d0" font-size="11" text-anchor="middle">(= Shannon limit of the magnitude/Tsallis invariant)</text>
+
+        <!-- forward arrows -->
+        <g stroke="#42c9ff" stroke-width="2" marker-end="url(#fwd)" fill="none">
+          <line x1="280" y1="102" x2="280" y2="130"/>
+          <line x1="280" y1="206" x2="280" y2="234"/>
+          <line x1="280" y1="276" x2="280" y2="304"/>
+          <line x1="280" y1="364" x2="280" y2="406"/>
+          <line x1="280" y1="452" x2="280" y2="480"/>
+          <line x1="280" y1="546" x2="280" y2="574"/>
+        </g>
+
+        <!-- backward (transpose / tape) arrow, on the right -->
+        <path d="M470,608 C520,500 520,200 470,72" stroke="#ff9f43" stroke-width="2"
+              stroke-dasharray="6 5" fill="none" marker-end="url(#bwd)"/>
+        <text x="527" y="350" fill="#ff9f43" font-size="12" transform="rotate(90 527 350)" text-anchor="middle">
+          backward = transpose of the forward morphism (Dual AddFun) · run as a Wengert tape
+        </text>
+      </g>
+    </svg>
+    <div class="legend muted" style="margin-top:8px">
+      <span><i class="swatch" style="background:#42c9ff"></i>forward morphism (D category)</span>
+      <span><i class="swatch" style="background:#ff9f43"></i>reverse / gradient (tape)</span>
+      <span><i class="swatch" style="background:#c792ea"></i>meaning (copresheaf)</span>
+      <span><i class="swatch" style="background:#7ee787"></i>semantic loss</span>
+    </div>
+  </div>
+
+  <div class="col">
+    <div class="card">
+      <h2 class="tdb">For Tai-Danae Bradley — meaning is enriched-categorical</h2>
+      <ul>
+        <li>The softmax output <em>is</em> a <code>[0,1]</code>-enriched copresheaf
+            <code>π(·|ctx)</code> — the representable hom <code>hˣ = L(x,−)</code>, the meaning of the context.</li>
+        <li>The loss <em>is</em> the semantic distance: relative entropy to the Dirac
+            ground-truth meaning (the Shannon <code>t→1</code> limit of the magnitude / Tsallis-entropy invariant).</li>
+        <li>Type-checked in Agda: <code>Semantics/{Enriched,Copresheaf,Language,Meaning}.agda</code>.</li>
+      </ul>
+      <p class="muted">Still rough: a toy modular-arithmetic language, not natural language; enrichment
+      laws recorded but not proved for the learned model; the copresheaf drives the loss but the learned
+      representations aren't yet shown to realize the enriched structure.</p>
+    </div>
+
+    <div class="card">
+      <h2 class="conal">For Conal Elliott — differentiation is a functor</h2>
+      <ul>
+        <li>The forward pass is one morphism; the backward pass is its <em>transpose</em> in
+            <code>Dual AddFun</code> (cartesian ↦ cocartesian) — gradients by the chain rule,
+            <strong>no hand-written backward</strong>.</li>
+        <li>Type-checked in Agda: <code>Cat/{D,Dual,Grad,VecPrim}.agda</code> (≈ "The Simple Essence of AD").</li>
+        <li><span class="ce">Speed:</span> the runtime is a <strong>Wengert tape</strong> — each node visited
+            once, no diamond recomputation (~27× over the point-free form: 17.7 → 0.67 s/epoch).</li>
+      </ul>
+      <p class="muted">Still rough: the fast path is an operational tape, not a pure categorical
+      interpretation; Compile-to-Categories (<code>toCcc</code>) didn't pan out for attention's reverse mode;
+      the loss uses a shift-invariant detached-max for stability; graph-parallelism unrealized.</p>
+    </div>
+
+    <div class="card">
+      <h2>Guarantees</h2>
+      <ul>
+        <li>Agda spec type-checks (CI).</li>
+        <li>Backend gradient = finite differences, 1.6e-11 (CI <code>transformer-gradcheck</code>).</li>
+        <li>Backend forward + loss = the Agda spec to <strong>~1e-16</strong> (CI <code>conformance</code> oracle).</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<footer>
+  Result: grokking reproduced for p=53 (99.6% test); p=97 learned to 100% test in ~29.4k steps.
+  · Static diagram; the interactive Reflex port is in <code>../frontend</code>.
+</footer>
+</body>
+</html>

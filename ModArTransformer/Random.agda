@@ -8,11 +8,18 @@ open import Data.Nat.Properties using (m<n+m; ≤-refl)
 open import Data.Product using (_×_; _,_)
 open import ModArTransformer.Tensor using (_f+_; _f-_; _f*_; _f/_; fzero)
 
--- ─── Combined LCG matching GHC System.Random (StdGen) ─────────────────────────
--- L'Ecuyer (1988), two-component combined generator.
--- GHC StdGen: g1 advances with (a1*s mod m1), g2 with (a2*s mod m2),
--- output = (g1 - g2) mod m1.
--- We match this so existing checkpoint.ckpt (seeded via mkStdGen 42) is loadable.
+-- ─── Combined LCG (the LEGACY, pre-1.2 GHC System.Random StdGen) ──────────────
+-- L'Ecuyer (1988), two-component combined generator: g1 advances with
+-- (a1*s mod m1), g2 with (a2*s mod m2), output = (g1 - g2) mod m1.
+--
+-- NOTE (RNG matching): this reproduces the OLD `random` (< 1.2) StdGen.  Since
+-- `random` 1.2 (2020) the Haskell StdGen is SplitMix — and the backend resolves
+-- `random-1.2.1.3` — so this generator and the backend's `mkStdGen`/`randomR` do
+-- NOT produce the same stream.  This RNG drives only the spec's *own* training
+-- loop (init, shuffle); Agda↔Haskell RNG / training-data equivalence is NOT
+-- claimed.  The conformance oracle is unaffected: it loads shared fixed params
+-- from a file, so the RNG is never exercised (it verifies the model, not the
+-- training recipe — see CONFORMANCE.md "Scope of the guarantee").
 
 record StdGen : Set where
   constructor mkStdGen

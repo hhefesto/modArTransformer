@@ -5,6 +5,37 @@ type-checked Agda specification (`ModArTransformer/**`). This document records t
 guarantees that the implementation actually tracks the spec, from cheapest/strongest-
 in-CI to the deepest (numeric) one.
 
+## Scope of the guarantee — what "follows the Agda spec" means here
+
+The conformance guarantee is about the **denotational model**, *not* the training
+procedure. Be precise about the boundary:
+
+- **Verified surface (what the oracle exercises):** the model — `transformerLogits` /
+  `transformerLoss` and their gradient, as a **pure function of `(params, input)`**.
+  `checks.conformance` feeds *shared, fixed* params from a file and compares Agda vs
+  Haskell on a few `(a,b,t)` cases; it never generates data, splits, shuffles, or runs
+  the optimizer loop. Forward + loss match to ~1e-16 (below).
+
+- **Out of scope (the training harness — intentionally NOT bit-faithful to the spec):**
+  the surrounding *recipe* has deliberately drifted between Agda and Haskell, and
+  nothing checks it. Known divergences:
+  | aspect | Agda spec | Haskell backend |
+  |---|---|---|
+  | train/test split | even/odd by position — deterministic, no RNG (`Data.agda`, `modArTransformer.agda:169`) | shuffle, then take halves — RNG-dependent (`Optimizer.hs` `splitData`) |
+  | shuffle | front-swap Fisher–Yates on `Vec` (`Data.agda`) | selection shuffle on a list (`Optimizer.hs`) |
+  | RNG | legacy L'Ecuyer LCG (`Random.agda`) | **SplitMix** (`random-1.2.1.3`) — different stream entirely |
+  | init values | Xavier `sqrt(6/(r+c))`, same leaf order — but different RNG ⇒ different numbers | same formula/order (`Main.hs` `initFlat`) |
+  | LR schedule | keyed on **epoch**, warmup minLR→base (`Train.agda`, `Schedule.agda`) | keyed on **global step**, warmup 0→base (`Optimizer.hs`) |
+  | optimizer (AdamW) | `Cat/Adamable.agda` | historical `Main.hs@62b0b4d` (eps-placement/warmup differ) |
+  | checkpoint | params-only; resets Adam + epoch on load | header + params + Adam m/v; full resume |
+
+This split is **by design**: the spec's denotational value is proving the *model + AD*
+correct (Conal's AD-as-categories; Tai-Danae's enriched-copresheaf loss), which the
+oracle covers. The training recipe (which examples are held out, batch order, RNG,
+schedule constants) is engineering, not semantics, and is not claimed to be bit-faithful.
+A fresh Agda run and a fresh Haskell run from the same seed are therefore *not* the same
+experiment — they share the model, not the trajectory.
+
 ## Guarantees in place today (all in CI via `nix flake check`)
 
 1. **The spec is well-formed** — `agda-modArTransformer-check` type-checks the whole
@@ -112,6 +143,7 @@ logits/loss/gradient match the Agda spec on shared inputs — the strongest conf
 
 | Guarantee | Status |
 |---|---|
+| Scope: *model* verified (forward/loss/gradient as a pure fn of params+input); *training harness* out of scope | ℹ️ see "Scope of the guarantee" |
 | Agda spec type-checks | ✅ CI (`agda-modArTransformer-check`) |
 | Gradient = finite differences | ✅ CI (`transformer-gradcheck`, 1.65e-11) |
 | Parameter serialization aligned (Agda ↔ Haskell) | ✅ verified (this doc) |

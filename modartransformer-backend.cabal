@@ -18,6 +18,19 @@ executable transformer-gradcheck
   ghc-options:      -O2 -threaded -rtsopts
   default-language: Haskell2010
 
+-- Haskell side of the Agda<->backend conformance oracle.
+executable transformer-conformance
+  main-is:          Conformance.hs
+  hs-source-dirs:   backend/transformer
+  other-modules:    AD, Tensor, Tape, Serialize, Transformer
+  build-depends:    base >=4.17 && <5
+                  , hmatrix
+                  , random
+                  , vector
+                  , deepseq
+  ghc-options:      -O2 -threaded -rtsopts
+  default-language: Haskell2010
+
 -- Full transformer training toward grokking (p=53).
 executable backend-transformer-train
   main-is:          Main.hs

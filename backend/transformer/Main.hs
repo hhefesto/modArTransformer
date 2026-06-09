@@ -16,8 +16,7 @@ import Data.Maybe (fromMaybe)
 import Control.DeepSeq (NFData, deepseq)
 import Control.Parallel.Strategies (parMap, rdeepseq, rseq, parListChunk, using)
 import qualified Options.Applicative as O
-import System.Directory (doesFileExist, renameFile)
-import System.IO (hFlush, hPutStrLn, stdout, stderr)
+import System.IO (hFlush, hPutStrLn, stdout, stderr, isEOF)
 import System.Exit (exitFailure)
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import Text.Printf (printf)
@@ -30,6 +29,7 @@ import Tensor
 import Serialize
 import Transformer
 import Optimizer
+import Checkpoint (CkptMeta(..), saveCkpt, loadCkpt)
 
 -- ── init (Xavier on matrices; zero biases; LN γ=1, β=0) ──────────────────────────
 
@@ -131,53 +131,9 @@ batchGradLoss :: forall v dM dF dK. ParamsC v dM dF dK
               => Params v dM dF dK -> [(Int, Int, Int)] -> (Params v dM dF dK, Double)
 batchGradLoss = parBatchGrad transformerGradLoss
 
--- ── checkpoint ──────────────────────────────────────────────────────────────────
-
--- Atomic save: write a sibling temp file, then rename into place.  rename is
--- atomic on the same filesystem (the temp lives in the same dir), so a save
--- interrupted mid-write leaves only the partial `.tmp` — the resumable checkpoint
--- at `path` is never corrupted.
-saveCkpt :: Serialize p => FilePath -> p -> AdamState p -> Int -> IO ()
-saveCkpt path ps st epoch = do
-  let tmp    = path ++ ".tmp"
-      header = unwords [ "CHECKPOINT_ADAMW", show epoch
-                       , show (asT st), show (asB1Pow st), show (asB2Pow st) ]
-      body   = toFloats ps ++ toFloats (asM st) ++ toFloats (asV st)
-  writeFile tmp (unlines (header : map show body))
-  renameFile tmp path
-
--- Load + validate.  `nParam` is the expected per-section float count; a file whose
--- body isn't exactly 3*nParam floats (params + Adam m + v) is incomplete/corrupt
--- (e.g. an interrupted pre-atomic-save) — fail loudly instead of crashing deep in
--- `fromFloats` with a cryptic shape error.
-loadCkpt :: Serialize p => Int -> FilePath -> IO (Maybe (p, AdamState p, Int))
-loadCkpt nParam path = do
-  exists <- doesFileExist path
-  if not exists then pure Nothing else do
-    contents <- readFile path
-    length contents `seq` pure ()
-    case lines contents of
-      [] -> bad "empty checkpoint file"
-      (header : rest) -> case words header of
-        ["CHECKPOINT_ADAMW", eS, tsS, b1S, b2S] ->
-          case (readMaybe eS, readMaybe tsS, readMaybe b1S, readMaybe b2S, traverse readMaybe rest) of
-            (Just e, Just ts, Just b1, Just b2, Just nums)
-              | length nums == 3 * nParam -> do
-                  let (ps,  r1) = fromFloats nums
-                      (mm,  r2) = fromFloats r1
-                      (vv,  _)  = fromFloats r2
-                      st = AdamState ts b1 b2 mm vv
-                  pure (Just (ps, st, e))
-              | otherwise -> bad $ "wrong float count: " ++ show (length nums)
-                  ++ ", expected " ++ show (3 * nParam)
-                  ++ " (likely an interrupted or wrong-model save)"
-            _ -> bad "non-numeric header/body field"
-        _ -> bad "unrecognized checkpoint header"
-  where
-    bad msg = do
-      hPutStrLn stderr $ "loadCkpt: " ++ path ++ " is invalid: " ++ msg
-        ++ ". Delete it to start fresh, or pass --checkpoint PATH for another file."
-      exitFailure
+-- softmax of a logit list (for the interactive prompt's reported probabilities)
+softmaxL :: [Double] -> [Double]
+softmaxL xs = let m = maximum xs; es = map (\x -> exp (x - m)) xs; z = sum es in map (/ z) es
 
 -- ── training loop ─────────────────────────────────────────────────────────────
 
@@ -195,6 +151,8 @@ data Cfg = Cfg
   , cCkpt     :: FilePath
   , cWD       :: Double   -- AdamW weight decay (matrices only)
   , cSeed     :: Int      -- RNG seed: data split + Xavier init + per-epoch shuffle
+  , cMode     :: String   -- the -m mode string (recorded in the checkpoint header)
+  , cPrompt   :: Bool     -- if set: load the checkpoint and run the REPL, don't train
   }
 
 -- Generic training loop, polymorphic over the parameter type `p`.  The
@@ -221,9 +179,9 @@ train cfg modelDesc (vI, dMI, dFI, dKI) mkInit bgrad acc = do
       nParamExpected = length (toFloats freshP)
   loaded <- loadCkpt nParamExpected (cCkpt cfg)
   (params0, st0, startEpoch) <- case loaded of
-    Just (ps, st, e) -> do
-      printf "Resumed %s at epoch %d (step %d)\n" (cCkpt cfg) e (asT st)
-      pure (ps, st, e + 1)
+    Just (meta, ps, st) -> do
+      printf "Resumed %s at epoch %d (step %d)\n" (cCkpt cfg) (ckEpoch meta) (asT st)
+      pure (ps, st, ckEpoch meta + 1)
     Nothing -> do
       printf "Fresh init (Xavier).\n"
       pure (freshP, initAdam, 1)
@@ -290,7 +248,7 @@ train cfg modelDesc (vI, dMI, dFI, dKI) mkInit bgrad acc = do
 
       loop !epoch !ps !st !g
         | epoch > lastEpoch = do
-            saveCkpt (cCkpt cfg) ps st (epoch - 1)
+            saveCkpt (cCkpt cfg) (CkptMeta "modarith" (cMode cfg) (epoch - 1)) ps st
             tEnd <- getCurrentTime
             let secs = realToFrac (diffUTCTime tEnd t0) :: Double
                 epochsRun = epoch - startEpoch
@@ -324,20 +282,59 @@ train cfg modelDesc (vI, dMI, dFI, dKI) mkInit bgrad acc = do
                 hFlush stdout
               else pure ()
             if epoch `mod` cCkptEv cfg == 0
-              then saveCkpt (cCkpt cfg) ps' st' epoch
+              then saveCkpt (cCkpt cfg) (CkptMeta "modarith" (cMode cfg) epoch) ps' st'
               else pure ()
             loop (epoch + 1) ps' st' g'
 
   loop startEpoch params0 st0 gE
+
+-- ── interactive prompt (load a checkpoint and query the model) ──────────────────
+
+-- Modular-model REPL.  Vocabulary = residues 0..p-1; input is two residues "a b";
+-- output is the model's predicted (a+b) mod p with its softmax probability.
+promptModular :: forall p v. Serialize p
+              => Cfg -> (StdGen -> p) -> (Int -> Int -> p -> V v) -> IO ()
+promptModular cfg mkInit logits = do
+  let g0     = mkStdGen (cSeed cfg)
+      nParam = length (toFloats (mkInit g0))
+      pMod   = cP cfg
+      inRange x = x >= 0 && x < pMod
+  loaded <- loadCkpt nParam (cCkpt cfg)
+  case loaded of
+    Nothing -> do
+      hPutStrLn stderr $ "No checkpoint at " ++ cCkpt cfg
+        ++ " — train this mode first (run without --prompt)."
+      exitFailure
+    Just (meta, ps, _st) -> do
+      printf "Loaded %s (mode %s, epoch %d).\n" (cCkpt cfg) (ckMode meta) (ckEpoch meta)
+      printf "Prompt: enter two residues  a b  in {0..%d} (e.g. \"3 5\"); :q to quit.\n" (pMod - 1)
+      hFlush stdout
+      let repl = do
+            eof <- isEOF
+            if eof then pure () else do
+              line <- getLine
+              if line == ":q" then pure () else do
+                case mapM readMaybe (words line) :: Maybe [Int] of
+                  Just [a, b] | inRange a && inRange b -> do
+                    let dist  = softmaxL (vtoList (logits a b ps))
+                        predI = argmaxList dist
+                        truth = (a + b) `mod` pMod
+                    printf "  (%d + %d) mod %d = %d   model: %d  (p=%.3f)  %s\n"
+                      a b pMod truth predI (dist !! predI)
+                      (if predI == truth then "OK" else "MISS" :: String)
+                  _ -> printf "  expected two integers in 0..%d, e.g. \"3 5\"; :q to quit\n" (pMod - 1)
+                hFlush stdout >> repl
+      repl
 
 -- ── model wrappers (supply the model-specific pieces to the generic loop) ───────
 
 train1 :: forall v dM dF dK.
           (ParamsC v dM dF dK, Adam (Params v dM dF dK), Serialize (Params v dM dF dK), Scale (Params v dM dF dK))
        => Cfg -> Proxy '(v, dM, dF, dK) -> IO ()
-train1 cfg _ =
-  train cfg "1-layer single-head transformer, seqLen=2, readout at position 0"
-        (vI, dMI, dFI, dKI) mkInit batchGradLoss accuracy
+train1 cfg _
+  | cPrompt cfg = promptModular cfg mkInit transformerLogitsVal
+  | otherwise   = train cfg "1-layer single-head transformer, seqLen=2, readout at position 0"
+                        (vI, dMI, dFI, dKI) mkInit batchGradLoss accuracy
   where vI  = fromIntegral (natVal (Proxy @v))  :: Int
         dMI = fromIntegral (natVal (Proxy @dM)) :: Int
         dFI = fromIntegral (natVal (Proxy @dF)) :: Int
@@ -347,9 +344,10 @@ train1 cfg _ =
 train2W :: forall v dM dF dK.
            (ParamsC2 v dM dF dK, Adam (Params2 v dM dF dK), Serialize (Params2 v dM dF dK), Scale (Params2 v dM dF dK))
         => Cfg -> Proxy '(v, dM, dF, dK) -> IO ()
-train2W cfg _ =
-  train cfg "2-layer transformer (two stacked single-head blocks), seqLen=2, readout at position 0"
-        (vI, dMI, dFI, dKI) mkInit bgrad acc
+train2W cfg _
+  | cPrompt cfg = promptModular cfg mkInit transformerLogitsVal2
+  | otherwise   = train cfg "2-layer transformer (two stacked single-head blocks), seqLen=2, readout at position 0"
+                        (vI, dMI, dFI, dKI) mkInit bgrad acc
   where vI  = fromIntegral (natVal (Proxy @v))  :: Int
         dMI = fromIntegral (natVal (Proxy @dM)) :: Int
         dFI = fromIntegral (natVal (Proxy @dF)) :: Int
@@ -373,7 +371,23 @@ data Opts = Opts
   , optEpochs :: Maybe Int       -- -e / --epochs      (Nothing → per-mode default)
   , optSeed   :: Int             -- -s / --seed        (default 42)
   , optCkpt   :: Maybe FilePath  -- -c / --checkpoint  (Nothing → checkpoint-<mode>.ckpt)
+  , optPrompt :: Bool            -- --prompt           (load checkpoint, REPL, don't train)
+  , optList   :: Bool            -- --list-modes       (print all -m modes and exit)
   }
+
+-- all selectable -m modes, printed by --list-modes
+listModesText :: String
+listModesText = unlines
+  [ "Modes (-m) for backend-transformer-train — learn (a+b) mod p:"
+  , "  p5      p=5,  1-layer   quick sanity (trains in seconds)"
+  , "  p53     p=53, 1-layer   canonical (wd=1e-3)"
+  , "  p53hi   p=53, 1-layer   accelerated grokking (wd=1e-2)"
+  , "  p97     p=97, 1-layer   canonical (wd=1e-3)"
+  , "  p97hi   p=97, 1-layer   accelerated grokking (wd=1e-2)"
+  , "  p5l2    p=5,  2-layer"
+  , "  p53l2   p=53, 2-layer   (wd=1e-2)"
+  , "  p97l2   p=97, 2-layer   (wd=1e-2)  [default — the paper's modulus, 2 layers]"
+  ]
 
 optsP :: O.Parser Opts
 optsP = Opts
@@ -387,6 +401,9 @@ optsP = Opts
         <> O.help "RNG seed for split/init/shuffle (run is deterministic per seed)")
   <*> O.optional (O.strOption (O.long "checkpoint" <> O.short 'c' <> O.metavar "PATH"
         <> O.help "checkpoint file (default checkpoint-<mode>.ckpt); resumes if present"))
+  <*> O.switch (O.long "prompt"
+        <> O.help "load the checkpoint and query the model interactively (no training)")
+  <*> O.switch (O.long "list-modes" <> O.help "list all -m modes and exit")
 
 main :: IO ()
 main = do
@@ -394,7 +411,7 @@ main = do
          ( O.fullDesc
            <> O.header "backend-transformer-train — denotational modular-arithmetic transformer"
            <> O.progDesc "Train (a+b) mod p via reverse-mode AD on a Wengert tape; reproduces grokking." )
-  case optMode o of
+  if optList o then putStr listModesText else case optMode o of
     "p5"    -> train1  (mk o 5  1.0 25 5000   200  2000 "checkpoint-p5.ckpt"    1.0e-3) (Proxy @'(5, 16, 64, 16))
     -- accelerated grokking probe: identical to the canonical run but with 10× weight
     -- decay (the established lever that brings grokking onset earlier).  Flat lr
@@ -423,4 +440,4 @@ main = do
       Cfg p frac batch schedEp warmup 1.0e-3 1.0e-5 5 50
           (fromMaybe epDef (optEpochs o))   -- cMaxRun
           (fromMaybe path  (optCkpt   o))   -- cCkpt
-          wd (optSeed o)
+          wd (optSeed o) (optMode o) (optPrompt o)

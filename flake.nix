@@ -266,21 +266,22 @@
             cp result.txt $out
           '';
 
-          # Agda↔backend numeric conformance: the Haskell harness writes a shared
-          # parameter file + its logits/loss/grad; the Agda oracle reads the params
+          # Agda↔backend numeric conformance: the Haskell harness writes shared
+          # parameter files + its logits/loss/grad; the Agda oracle reads the params
           # and writes the spec's logits/loss/grad; we tolerance-diff the streams.
-          # Each per-case block is 3 logits + 1 loss + 207 grad = 211 floats.
-          # Forward, loss, and gradient must all match. Each block starts with
-          # 3 logits + 1 loss, followed by the 207-gradient stream.
+          # The stream now holds TWO sections (the seqLen-2 model's three cases and
+          # the generalized causal 2-head sequence model's two cases), so the gate
+          # is one global max|d| over every emitted float — forward, loss, and
+          # gradient of both models must all agree to <= 1e-9.
           conformance = pkgs.runCommand "conformance" { } ''
             ${self'.packages.modartransformer-backend}/bin/transformer-conformance
             ${self'.packages.agda-modArConformanceOracle}/bin/agda-modArConformanceOracle
+            hs=$(awk 'END{print NR}' conformance-hs.txt); ag=$(awk 'END{print NR}' conformance-agda.txt)
+            [ "$hs" = "$ag" ] || { echo "stream length mismatch: $hs vs $ag"; exit 1; }
             paste conformance-hs.txt conformance-agda.txt | awk '
-              { i=(NR-1)%211; d=$1-$2; if(d<0)d=-d;
-                if(i<4){ if(d>fmax)fmax=d } else { if(d>gmax)gmax=d } }
-              END{ printf "forward+loss max|d|=%g  grad max|d|=%g\n", fmax, gmax;
-                   if(fmax>1e-9){ print "FORWARD/LOSS CONFORMANCE FAILED"; exit 1 }
-                   if(gmax>1e-9){ print "GRADIENT CONFORMANCE FAILED"; exit 1 }
+              { d=$1-$2; if(d<0)d=-d; if(d>dmax)dmax=d }
+              END{ printf "max|d|=%g over %d floats (both models)\n", dmax, NR;
+                   if(dmax>1e-9){ print "CONFORMANCE FAILED"; exit 1 }
                    print "FORWARD+LOSS+GRAD CONFORMANCE OK (Agda==Haskell to ~1e-16)" }' | tee r.txt
             grep -q "FORWARD+LOSS+GRAD CONFORMANCE OK" r.txt
             cp r.txt $out

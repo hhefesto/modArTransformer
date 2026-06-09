@@ -6,6 +6,8 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ExplicitNamespaces #-}
+{-# LANGUAGE TypeOperators #-}
 
 -- Shape-indexed tensors backed by hmatrix (BLAS).  This is *one interpretation*
 -- of the linear-map category: dense vectors/matrices over Double.  The AD/tape
@@ -36,9 +38,11 @@ module Tensor
   , vmaxElem
   , mrow
   , mScatterRow
+  , vconcatT
+  , vsplitT
   ) where
 
-import GHC.TypeNats (KnownNat, Nat, natVal)
+import GHC.TypeNats (KnownNat, Nat, natVal, type (+))
 import Data.Proxy (Proxy(..))
 import Control.DeepSeq (NFData(..))
 import qualified Numeric.LinearAlgebra as LA
@@ -162,6 +166,14 @@ vmaxElem (V v) = VS.maximum v
 -- extract row i of a matrix as a vector
 mrow :: M m n -> Int -> V n
 mrow (M m) i = V (LA.flatten (m LA.? [i]))
+
+-- concatenate two vectors (multi-head concat); linear, so its adjoint is vsplitT
+vconcatT :: V a -> V b -> V (a + b)
+vconcatT (V x) (V y) = V (VS.concat [x, y])
+
+-- split a vector at the type-level boundary (the adjoint of vconcatT)
+vsplitT :: forall a b. KnownNat a => V (a + b) -> (V a, V b)
+vsplitT (V v) = let k = natI @a in (V (VS.take k v), V (VS.drop k v))
 
 -- zero matrix with row i set to v (used by the embedding adjoint)
 mScatterRow :: forall m n. (KnownNat m, KnownNat n) => Int -> V n -> M m n

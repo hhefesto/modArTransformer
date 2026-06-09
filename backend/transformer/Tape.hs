@@ -5,6 +5,8 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ExplicitNamespaces #-}
+{-# LANGUAGE TypeOperators #-}
 
 -- Reverse-mode AD with a Wengert tape (ST).  Each node owns a mutable cotangent
 -- cell; consumers ADD into it.  Backprop runs the recorded nodes once in reverse
@@ -17,16 +19,17 @@
 -- sequences their accumulation.  Still no hand-written backward for any composite.
 module Tape
   ( R, primalR
-  , Tape, tGradLoss, tEval
+  , Tape, tGradLoss, tEval, tEvalMany
   , tInput, tConst
   , tAdd, tSub, tMul, tExp, tLog, tRecip, tRsqrt, tScaleC, tAddC
   , tVadd, tMatvec, tHadamard, tVdot, tScaleV, tExpV, tSquareV, tReluV
   , tVsum, tMeanV, tCenter, tSelect, tDetachMax, tEmbedRow
+  , tConcatV
   ) where
 
 import Control.Monad.ST
 import Data.STRef
-import GHC.TypeNats (KnownNat)
+import GHC.TypeNats (KnownNat, type (+))
 import AD (Lens(..))
 import Tensor
 
@@ -138,6 +141,14 @@ tDetachMax tp (R x rx) = let !m = vmaxElem x in node tp (vmapT (subtract m) x) (
 tEmbedRow :: (KnownNat r, KnownNat c) => Tape s p -> Int -> R s (M r c) -> ST s (R s (V c))
 tEmbedRow tp i (R w rw) = node tp (mrow w i) (\dv -> addTo rw (mScatterRow i dv))
 
+-- concat (linear): adjoint splits the cotangent at the boundary — the
+-- multi-head concat (mirrors Cat/SeqPrim.agda appendD)
+tConcatV :: (KnownNat a, KnownNat b, KnownNat (a + b))
+         => Tape s p -> R s (V a) -> R s (V b) -> ST s (R s (V (a + b)))
+tConcatV tp (R x rx) (R y ry) =
+  node tp (vconcatT x y)
+          (\dz -> let (dx, dy) = vsplitT dz in addTo rx dx >> addTo ry dy)
+
 -- ── driver ────────────────────────────────────────────────────────────────────
 
 -- Run a forward computation that returns the scalar loss node, then backprop and
@@ -162,3 +173,11 @@ tEval build = runST $ do
   gref <- newSTRef zeroA
   R v _ <- build (Tape acts gref)
   pure v
+
+-- Forward-only evaluation of a family of outputs (per-position logits).
+tEvalMany :: forall p x. Additive p => (forall s. Tape s p -> ST s [R s x]) -> [x]
+tEvalMany build = runST $ do
+  acts <- newSTRef []
+  gref <- newSTRef zeroA
+  rs <- build (Tape acts gref)
+  pure (map primalR rs)

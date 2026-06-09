@@ -21,9 +21,22 @@ type DF = 8
 type DK = 4
 type P  = Params V' DM DF DK
 
+-- tiny SEQUENCE model, matching the oracle's second section
+-- (vocab 5, n 4, dM 4, dF 8, dK 2 — causal, two heads)
+type VS  = 5
+type NS  = 4
+type DMS = 4
+type DFS = 8
+type DKS = 2
+type PS  = ParamsSeq VS NS DMS DFS DKS
+
 -- same three cases as the Agda oracle: (a, b, (a+b) mod 3)
 cases :: [(Int, Int, Int)]
 cases = [ (1, 2, 0), (0, 1, 1), (2, 2, 1) ]
+
+-- same two token sequences as the Agda oracle
+seqCases :: [[Int]]
+seqCases = [ [1, 4, 2, 3], [0, 2, 4, 1] ]
 
 -- logits ++ [loss] ++ gradient, in the same order the Agda oracle emits.
 perCase :: P -> (Int, Int, Int) -> [Double]
@@ -32,13 +45,27 @@ perCase params (a, b, t) =
       (g, l)   = transformerGradLoss a b t params
   in logits ++ (l : toFloats g)
 
+-- per-position logits ++ [loss] ++ gradient for the sequence model.
+perSeqCase :: PS -> [Int] -> [Double]
+perSeqCase params toks =
+  let logits = concatMap vtoList (seqLogitsVal toks params)
+      (g, l) = seqGradLoss toks params
+  in logits ++ (l : toFloats g)
+
 main :: IO ()
 main = do
   let n      = length (toFloats (zeroA :: P))
       flat   = take n (randomRs (-0.4, 0.4) (mkStdGen 7)) :: [Double]
       params = fst (fromFloats flat) :: P
       hs     = concatMap (perCase params) cases
-  writeFile "conformance-params.txt" (unlines (map show flat))
-  writeFile "conformance-hs.txt"     (unlines (map show hs))
+      nS      = length (toFloats (zeroA :: PS))
+      flatS   = take nS (randomRs (-0.4, 0.4) (mkStdGen 13)) :: [Double]
+      paramsS = fst (fromFloats flatS) :: PS
+      hsS     = concatMap (perSeqCase paramsS) seqCases
+  writeFile "conformance-params.txt"     (unlines (map show flat))
+  writeFile "conformance-seq-params.txt" (unlines (map show flatS))
+  writeFile "conformance-hs.txt"         (unlines (map show (hs ++ hsS)))
   putStrLn ("[conformance] wrote conformance-params.txt (" ++ show n
-            ++ " params) and conformance-hs.txt (" ++ show (length hs) ++ " floats)")
+            ++ " params), conformance-seq-params.txt (" ++ show nS
+            ++ " params) and conformance-hs.txt ("
+            ++ show (length hs + length hsS) ++ " floats)")

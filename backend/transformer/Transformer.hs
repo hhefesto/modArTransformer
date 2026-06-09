@@ -24,11 +24,21 @@ module Transformer
   , Block, Params2, ParamsC2
   , transformerLogitsVal2
   , transformerGradLoss2
+  -- pre-unembed residual ("meaning" representation, position 0 of the final
+  -- block) — used by the enriched-semantics probe.
+  , transformerReprVal2
+  -- generalized sequence model (n positions, causal, two heads) — mirrors
+  -- ModArTransformer/Layers/SeqTransformer.agda with the same parameter
+  -- nesting, so Serialize stays aligned leaf-for-leaf with the Agda side.
+  , HeadP, MH2, SeqBlock, ParamsSeq, ParamsCSeq
+  , seqLogitsVal
+  , seqGradLoss
   ) where
 
+import Control.Monad (forM, foldM, zipWithM)
 import Control.Monad.ST (ST)
 import Control.DeepSeq (NFData)
-import GHC.TypeNats (KnownNat, natVal)
+import GHC.TypeNats (KnownNat, natVal, type (+))
 import Data.Proxy (Proxy(..))
 import AD (Lens, fstL, sndL, (.<))
 import Tape
@@ -260,14 +270,17 @@ blockT tp p lAttn lLn1 lFfn lLn2 sc x0 x1 = do
   y1 <- finish q1 x1
   pure (y0, y1)
 
-forwardT2 :: forall s v dM dF dK. ParamsC2 v dM dF dK
-          => Tape s (P2 v dM dF dK) -> Int -> Int -> P2 v dM dF dK -> ST s (R s (V v))
-forwardT2 tp tokA tokB p = do
+-- forward up to (but not including) the unembed: the position-0 residual of the
+-- final block.  This is the context's "meaning" vector — what the enriched
+-- copresheaf (the softmax) is read off from.  forwardT2 = unembed ∘ this, so the
+-- logits/grad path is unchanged.
+forwardT2Repr :: forall s v dM dF dK. ParamsC2 v dM dF dK
+              => Tape s (P2 v dM dF dK) -> Int -> Int -> P2 v dM dF dK -> ST s (R s (V dM))
+forwardT2Repr tp tokA tokB p = do
   let lTok = fstL
       lPos = sndL .< fstL
       lB1  = sndL .< sndL .< fstL
       lB2  = sndL .< sndL .< sndL .< fstL
-      lUn  = sndL .< sndL .< sndL .< sndL
   rTok <- tInput tp lTok p
   rPos <- tInput tp lPos p
   let embedAt tk ps = do
@@ -281,6 +294,13 @@ forwardT2 tp tokA tokB p = do
                           (lB1 .< sndL .< sndL .< fstL) (lB1 .< sndL .< sndL .< sndL) sc e0 e1
   (o0, _o1) <- blockT tp p (lB2 .< fstL) (lB2 .< sndL .< fstL)
                           (lB2 .< sndL .< sndL .< fstL) (lB2 .< sndL .< sndL .< sndL) sc h0 h1
+  pure o0
+
+forwardT2 :: forall s v dM dF dK. ParamsC2 v dM dF dK
+          => Tape s (P2 v dM dF dK) -> Int -> Int -> P2 v dM dF dK -> ST s (R s (V v))
+forwardT2 tp tokA tokB p = do
+  o0 <- forwardT2Repr tp tokA tokB p
+  let lUn = sndL .< sndL .< sndL .< sndL
   uW <- tInput tp (lUn .< fstL) p
   uB <- tInput tp (lUn .< sndL) p
   affineT tp uW uB o0
@@ -288,6 +308,11 @@ forwardT2 tp tokA tokB p = do
 transformerLogitsVal2 :: forall v dM dF dK. ParamsC2 v dM dF dK
                       => Int -> Int -> P2 v dM dF dK -> V v
 transformerLogitsVal2 a b p = tEval (\tp -> forwardT2 tp a b p)
+
+-- the context's pre-unembed "meaning" vector (position-0 residual of the final block)
+transformerReprVal2 :: forall v dM dF dK. ParamsC2 v dM dF dK
+                    => Int -> Int -> P2 v dM dF dK -> V dM
+transformerReprVal2 a b p = tEval (\tp -> forwardT2Repr tp a b p)
 
 transformerGradLoss2 :: forall v dM dF dK. ParamsC2 v dM dF dK
                      => Int -> Int -> Int -> P2 v dM dF dK -> (P2 v dM dF dK, Double)
@@ -302,3 +327,132 @@ transformerGradLoss2 a b t p = tGradLoss build
       lse <- tLog tp s
       sel <- tSelect @s @_ @v tp t l2
       tSub tp lse sel
+
+-- ── generalized sequence model ────────────────────────────────────────────────
+--
+-- n positions, CAUSAL attention (position i attends 0..i), TWO heads (concat +
+-- joint Wo), one block, next-token logits at every position, loss = mean
+-- cross-entropy over the n−1 prediction positions.  This is the Phase-0/1
+-- model of the production roadmap (README §10).  The parameter tree nests
+-- exactly like SeqTransformer.agda's SeqTransformerParams, so the shared flat
+-- [Float] layout (Serialize ↔ Cat/Serialize.agda) is identical and the
+-- conformance oracle can feed both sides the same parameters.
+
+type HeadP dM dK    = (Lin dK dM, (Lin dK dM, Lin dK dM))      -- Wq, (Wk, Wv)
+type MH2 dM dK      = (HeadP dM dK, (HeadP dM dK, Lin dM (dK + dK)))
+type SeqBlock dM dF dK = (MH2 dM dK, (LN dM, (FFN dM dF, LN dM)))
+
+type ParamsSeq v n dM dF dK =
+  ( M v dM                                  -- tokEmbed
+  , ( M n dM                                -- posEmbed
+  , ( SeqBlock dM dF dK
+  ,   Lin v dM )))                          -- unembed
+
+type PSeq v n dM dF dK = ParamsSeq v n dM dF dK
+
+type ParamsCSeq v n dM dF dK =
+  ( KnownNat v, KnownNat n, KnownNat dM, KnownNat dF, KnownNat dK
+  , KnownNat (dK + dK)
+  , Additive (M v dM), Additive (M n dM), Additive (V v)
+  , Additive (M dK dM), Additive (V dK), Additive (M dM (dK + dK)), Additive (V dM)
+  , Additive (V (dK + dK))
+  , Additive (M dF dM), Additive (V dF), Additive (M dM dF)
+  , Additive (ParamsSeq v n dM dF dK), NFData (ParamsSeq v n dM dF dK) )
+
+fold1M :: Monad m => (a -> a -> m a) -> [a] -> m a
+fold1M f (x : xs) = foldM f x xs
+fold1M _ []       = error "fold1M: empty"
+
+-- forward over the whole sequence: next-token logits at every position.
+forwardSeqT :: forall s v n dM dF dK. ParamsCSeq v n dM dF dK
+            => Tape s (PSeq v n dM dF dK) -> [Int] -> PSeq v n dM dF dK
+            -> ST s [R s (V v)]
+forwardSeqT tp toks p = do
+  let lTok = fstL
+      lPos = sndL .< fstL
+      lBlk = sndL .< sndL .< fstL
+      lUn  = sndL .< sndL .< sndL
+      lAtt = lBlk .< fstL
+      lLn1 = lBlk .< sndL .< fstL
+      lFfn = lBlk .< sndL .< sndL .< fstL
+      lLn2 = lBlk .< sndL .< sndL .< sndL
+      lH1  = lAtt .< fstL
+      lH2  = lAtt .< sndL .< fstL
+      lWo  = lAtt .< sndL .< sndL
+      sc   = 1.0 / sqrt (fromIntegral (natVal (Proxy @dK)))
+  rTok <- tInput tp lTok p
+  rPos <- tInput tp lPos p
+  embeds <- mapM (\(i, tk) -> do
+                    et <- tEmbedRow tp tk rTok
+                    ep <- tEmbedRow tp i rPos
+                    tVadd tp et ep)
+                 (zip [0 ..] toks)
+  -- one head: causal per-position outputs (mirrors SeqTransformer.headOuts;
+  -- the mask is realized by attending only the prefix — masked weights are 0
+  -- on the Agda side, absent here: same weights, same parameter cotangents).
+  let headOuts lH = do
+        let lWq = lH .< fstL
+            lWk = lH .< sndL .< fstL
+            lWv = lH .< sndL .< sndL
+        qW <- tInput tp (lWq .< fstL) p ; qB <- tInput tp (lWq .< sndL) p
+        kW <- tInput tp (lWk .< fstL) p ; kB <- tInput tp (lWk .< sndL) p
+        vW <- tInput tp (lWv .< fstL) p ; vB <- tInput tp (lWv .< sndL) p
+        qs <- mapM (affineT tp qW qB) embeds
+        ks <- mapM (affineT tp kW kB) embeds
+        vs <- mapM (affineT tp vW vB) embeds
+        forM (zip [0 ..] qs) $ \(i, qi) -> do
+          let ksA = take (i + 1) ks
+              vsA = take (i + 1) vs
+          ds  <- mapM (tVdot tp qi) ksA
+          ss  <- mapM (tScaleC tp sc) ds
+          let sm = maximum (map primalR ss)
+          ss' <- mapM (tAddC tp (negate sm)) ss
+          es  <- mapM (tExp tp) ss'
+          z   <- fold1M (tAdd tp) es
+          rz  <- tRecip tp z
+          ws  <- mapM (\e -> tMul tp e rz) es
+          avs <- zipWithM (tScaleV tp) ws vsA
+          fold1M (tVadd tp) avs
+  h1 <- headOuts lH1
+  h2 <- headOuts lH2
+  oW  <- tInput tp (lWo .< fstL) p  ; oB  <- tInput tp (lWo .< sndL) p
+  g1  <- tInput tp (lLn1 .< fstL) p ; b1  <- tInput tp (lLn1 .< sndL) p
+  upW <- tInput tp (lFfn .< fstL .< fstL) p ; upB <- tInput tp (lFfn .< fstL .< sndL) p
+  dnW <- tInput tp (lFfn .< sndL .< fstL) p ; dnB <- tInput tp (lFfn .< sndL .< sndL) p
+  g2  <- tInput tp (lLn2 .< fstL) p ; b2  <- tInput tp (lLn2 .< sndL) p
+  uW  <- tInput tp (lUn .< fstL) p  ; uB  <- tInput tp (lUn .< sndL) p
+  forM (zip3 embeds h1 h2) $ \(x, a1, a2) -> do
+    cat <- tConcatV tp a1 a2
+    ao  <- affineT tp oW oB cat
+    r10 <- tVadd tp x ao
+    n10 <- layerNormT tp g1 b1 r10
+    hh  <- affineT tp upW upB n10
+    hr  <- tReluV tp hh
+    ff  <- affineT tp dnW dnB hr
+    r20 <- tVadd tp n10 ff
+    o   <- layerNormT tp g2 b2 r20
+    affineT tp uW uB o
+
+-- next-token logits at every position (forward only).
+seqLogitsVal :: forall v n dM dF dK. ParamsCSeq v n dM dF dK
+             => [Int] -> PSeq v n dM dF dK -> [V v]
+seqLogitsVal toks p = tEvalMany (\tp -> forwardSeqT tp toks p)
+
+-- mean next-token cross-entropy over the n−1 prediction positions, with its
+-- gradient (position i predicts token i+1) — mirrors seqTransformerLoss.
+seqGradLoss :: forall v n dM dF dK. ParamsCSeq v n dM dF dK
+            => [Int] -> PSeq v n dM dF dK -> (PSeq v n dM dF dK, Double)
+seqGradLoss toks p = tGradLoss build
+  where
+    build :: forall s. Tape s (PSeq v n dM dF dK) -> ST s (R s Double)
+    build tp = do
+      logits <- forwardSeqT tp toks p
+      ls <- forM (zip (init logits) (tail toks)) $ \(lg, t) -> do
+        l2  <- tDetachMax tp lg
+        e   <- tExpV tp l2
+        s   <- tVsum tp e
+        lse <- tLog tp s
+        sel <- tSelect @s @_ @v tp t l2
+        tSub tp lse sel
+      tot <- fold1M (tAdd tp) ls
+      tScaleC tp (1 / fromIntegral (length ls)) tot

@@ -37,7 +37,7 @@ executable transformer-conformance
 executable backend-transformer-train
   main-is:          Main.hs
   hs-source-dirs:   backend/transformer
-  other-modules:    AD, Tensor, Tape, Serialize, Transformer, Optimizer
+  other-modules:    AD, Tensor, Tape, Serialize, Transformer, Optimizer, Checkpoint
   build-depends:    base >=4.17 && <5
                   , hmatrix
                   , random
@@ -48,4 +48,64 @@ executable backend-transformer-train
                   , optparse-applicative
                   , parallel
   ghc-options:      -O2 -threaded -rtsopts "-with-rtsopts=-N -A64m -I0"
+  default-language: Haskell2010
+
+-- Harder algorithmic benchmark harness for comparing transformer topologies.
+-- Starts with fixed-length Dyck-1 balanced-parentheses classification.
+executable transformer-benchmarks
+  main-is:          DyckBenchmark.hs
+  hs-source-dirs:   backend/transformer
+  other-modules:    AD, Tensor, Tape, Serialize, Transformer, Optimizer, Checkpoint
+  build-depends:    base >=4.17 && <5
+                  , hmatrix
+                  , random
+                  , vector
+                  , deepseq
+                  , directory
+                  , optparse-applicative
+  ghc-options:      -O2 -threaded -rtsopts
+  default-language: Haskell2010
+
+-- Enriched-semantics probe: does the trained (a+b) mod p model realize Tai-Danae
+-- Bradley's enriched-category structure (Yoneda synonymy collapse + the ℤ/p
+-- "grokking circle" in the space of meanings)?  Read-only over a checkpoint.
+executable enriched-probe
+  main-is:          EnrichedProbe.hs
+  hs-source-dirs:   backend/transformer
+  other-modules:    AD, Tensor, Tape, Serialize, Transformer
+  build-depends:    base >=4.17 && <5
+                  , hmatrix
+                  , vector
+                  , deepseq
+                  , optparse-applicative
+  ghc-options:      -O2 -threaded -rtsopts
+  default-language: Haskell2010
+
+-- Property checks for the market tokenizer (backend/data/MarketTokenizer.hs)
+-- against its Agda denotation (Semantics/MarketLanguage.agda): monotonicity,
+-- vocabulary layout, decode coherence, the no-lookahead rule, artifact I/O.
+executable market-tokenizer-check
+  main-is:          TokenizerCheck.hs
+  hs-source-dirs:   backend/data
+  other-modules:    MarketTokenizer
+  build-depends:    base >=4.17 && <5
+                  , random
+  ghc-options:      -O2
+  default-language: Haskell2010
+
+-- Phase B: a synthetic next-token "ℤ/m rotation walk" language whose enriched
+-- structure is ground-truth; trains a small transformer then probes Yoneda
+-- synonymy collapse + the group-action composition law.
+executable synth-lang-probe
+  main-is:          SynthLangProbe.hs
+  hs-source-dirs:   backend/transformer
+  other-modules:    AD, Tensor, Tape, Serialize, Transformer, Optimizer, Checkpoint
+  build-depends:    base >=4.17 && <5
+                  , hmatrix
+                  , random
+                  , vector
+                  , deepseq
+                  , directory
+                  , optparse-applicative
+  ghc-options:      -O2 -threaded -rtsopts
   default-language: Haskell2010

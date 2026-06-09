@@ -19,7 +19,7 @@ open import ModArTransformer.Tensor using (_f+_; _f-_; _f*_; _f/_; fzero)
 -- loop (init, shuffle); Agda↔Haskell RNG / training-data equivalence is NOT
 -- claimed.  The conformance oracle is unaffected: it loads shared fixed params
 -- from a file, so the RNG is never exercised (it verifies the model, not the
--- training recipe — see CONFORMANCE.md "Scope of the guarantee").
+-- training recipe — see README.md §4 "Scope of the guarantee").
 
 record StdGen : Set where
   constructor mkStdGen

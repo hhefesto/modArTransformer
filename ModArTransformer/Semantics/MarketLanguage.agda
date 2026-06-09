@@ -1,0 +1,156 @@
+-- Market data as a token language, and the [0,1]-enriched category of texts
+-- that a next-token model induces on it.
+--
+-- Tai-Danae Bradley, "The Magnitude of Categories of Texts Enriched by Language
+-- Models" (2025): any autoregressive next-token model π over a finite vocabulary
+-- with begin/end tokens (⊥, †) defines a [0,1]-enriched category of texts with
+--
+--   L(x, y) := π(y | x) = ∏ of next-token probabilities along the extension
+--
+-- when y extends x (and 0 otherwise), identities π(x|x) = 1, and composition
+-- π(z|y) ⊗ π(y|x) ≤ π(z|x) — an equality on nested extensions (the chain rule).
+--
+-- The market enters only through the TOKENIZER: a candle's return is quantized
+-- into one of nBins bins by sorted bin edges.  `quantize` below is the
+-- denotation the backend tokenizer (MarketTokenizer.hs) must realize: total and
+-- surjective by construction, monotone when the edges are sorted (stated as an
+-- obligation).  The "language of the market" is then sequences of bin tokens
+-- delimited by ⊥/†, and a trained model's softmax at each prefix is its meaning
+-- copresheaf, exactly as in Semantics.Meaning for the modular language — only
+-- now at every prefix length, not just length 2.
+--
+-- Felix-style Raw/Laws split: structures are computable; the identity law is
+-- proved, the composition law and quantizer monotonicity are stated as
+-- predicates to be discharged later (like Semantics.Enriched).
+{-# OPTIONS --guardedness #-}
+module ModArTransformer.Semantics.MarketLanguage where
+
+open import Data.Nat using (ℕ; suc; zero; _≤_)
+open import Data.Fin using (Fin; zero; suc; toℕ)
+open import Data.List using (List; []; _∷_; _++_; [_])
+open import Data.Bool using (Bool; true; false; if_then_else_; not; T)
+open import Data.Maybe using (Maybe; just; nothing; maybe′)
+open import Data.Unit using (⊤; tt)
+open import Data.Product using (_×_; _,_)
+open import Data.Vec.Base using (lookup; []; _∷_)
+open import Relation.Binary.PropositionalEquality using (_≡_; refl)
+
+open import ModArTransformer.Tensor
+open import ModArTransformer.Semantics.Interval
+open import ModArTransformer.Semantics.Enriched
+open import ModArTransformer.Semantics.Copresheaf
+
+module Market (nEdges : ℕ) where
+
+  -- nBins = suc nEdges bins are cut by nEdges sorted interior edges, so the
+  -- quantizer below is total and surjective by construction.
+  nBins : ℕ
+  nBins = suc nEdges
+
+  -- ─── vocabulary: ⊥ (begin), † (end), then the return bins ────────────────────
+
+  v : ℕ
+  v = suc (suc nBins)
+
+  Tok : Set
+  Tok = Fin v
+
+  ⊥tok †tok : Tok
+  ⊥tok = zero
+  †tok = suc zero
+
+  bin : Fin nBins → Tok
+  bin i = suc (suc i)
+
+  -- ─── the tokenizer's denotation ───────────────────────────────────────────────
+
+  -- quantize edges r = the index of the half-open bin
+  --   (−∞,e₀) , [e₀,e₁) , … , [eₖ₋₁,∞)
+  -- that r falls in (= the number of edges at or below r).
+  quantize : {k : ℕ} → ℝVec k → Float → Fin (suc k)
+  quantize []       _ = zero
+  quantize (e ∷ es) r = if r f< e then zero else suc (quantize es r)
+
+  tokenizeReturn : ℝVec nEdges → Float → Tok
+  tokenizeReturn edges r = bin (quantize edges r)
+
+  -- sortedness of the edge vector (non-strict, ascending).
+  Sorted : {k : ℕ} → ℝVec k → Set
+  Sorted []            = ⊤
+  Sorted (_ ∷ [])      = ⊤
+  Sorted (e ∷ e′ ∷ es) = T (not (e′ f< e)) × Sorted (e′ ∷ es)
+
+  -- The law the backend tokenizer must satisfy (obligation): with sorted
+  -- edges, quantization is monotone — larger returns land in later bins.
+  -- Side condition carried by the pipeline, not the type: the edges are
+  -- FITTED ON THE TRAINING WINDOW ONLY (the no-lookahead/leakage rule).
+  QuantizeMono : Set
+  QuantizeMono =
+    (edges : ℝVec nEdges) → Sorted edges →
+    (r s : Float) → T (not (s f< r)) →            -- r ≤ s
+    toℕ (quantize edges r) ≤ toℕ (quantize edges s)
+
+  -- ─── the enriched category of texts induced by a next-token model ─────────────
+
+  Text : Set
+  Text = List Tok
+
+  -- π(·|x): the model's next-token distribution at prefix x (its softmax).
+  NextTok : Set
+  NextTok = Text → ℝVec v
+
+  private
+    finEqBool : {m : ℕ} → Fin m → Fin m → Bool
+    finEqBool zero    zero    = true
+    finEqBool zero    (suc _) = false
+    finEqBool (suc _) zero    = false
+    finEqBool (suc i) (suc j) = finEqBool i j
+
+    -- the suffix of ys after xs, if xs is a prefix of ys.
+    stripPrefix : Text → Text → Maybe Text
+    stripPrefix []       ys       = just ys
+    stripPrefix (_ ∷ _)  []       = nothing
+    stripPrefix (x ∷ xs) (y ∷ ys) =
+      if finEqBool x y then stripPrefix xs ys else nothing
+
+  -- π(ts | x): the probability that the model continues x with exactly ts —
+  -- the product of next-token probabilities along the way (autoregressive
+  -- chain rule).
+  extendProb : NextTok → Text → Text → I
+  extendProb π x []       = 1ᴵ
+  extendProb π x (t ∷ ts) = lookup (π x) t ⊗ᴵ extendProb π (x ++ [ t ]) ts
+
+  -- | Bradley's category of texts, generated by the model:
+  --   hom x y = π(y|x) when y extends x, 0 otherwise.
+  L : NextTok → EnrichedCat
+  L π = record
+    { Obj = Text
+    ; hom = λ x y → maybe′ (extendProb π x) 0ᴵ (stripPrefix x y)
+    }
+
+  -- | The meaning of a market history x: its representable copresheaf
+  --   よ x = L(x, −) — "everything this history can become, weighted by π".
+  meaning : (π : NextTok) → Text → Copresheaf (L π)
+  meaning π = よ {L = L π}
+
+  -- ─── enrichment laws ──────────────────────────────────────────────────────────
+
+  private
+    finEqRefl : {m : ℕ} (i : Fin m) → finEqBool i i ≡ true
+    finEqRefl zero    = refl
+    finEqRefl (suc i) = finEqRefl i
+
+    stripPrefixRefl : (xs : Text) → stripPrefix xs xs ≡ just []
+    stripPrefixRefl []       = refl
+    stripPrefixRefl (x ∷ xs) rewrite finEqRefl x = stripPrefixRefl xs
+
+  -- Identity law, proved: every text extends itself with probability 1.
+  idLaw : (π : NextTok) → IdLaw (L π)
+  idLaw π x rewrite stripPrefixRefl x = tt
+
+  -- Composition law (obligation): π(z|y) ⊗ π(y|x) ≤ π(z|x).  On nested
+  -- extensions x ⊑ y ⊑ z it is an equality — the autoregressive chain rule —
+  -- and 0 ≤ π(z|x) otherwise; a Float-level proof is future hardening, like
+  -- the laws in Semantics.Enriched.
+  CompLawHolds : NextTok → Set
+  CompLawHolds π = CompLaw (L π)

@@ -56,3 +56,15 @@ conformance-agda.txt
 
 # Claude Code: track settings.local.json, ignore the runtime scheduler lock
 .claude/scheduled_tasks.lock
+
+# market data + probe artifacts
+data/
+market-magnitude.csv
+checkpoint-mkt-*.ckpt*
+*.ckpt.tok
+
+# gpu tier build artifacts
+gpu/conformance-g
+gpu/conformance-gpu.txt
+checkpoint-*.ckpt.best
+enriched-modp-circle.csv

@@ -234,6 +234,8 @@
             # (`cabal`).  Includes the backend deps + text (MAlonzo FFI).
             (pkgs.haskellPackages.ghcWithPackages (p: [
               p.hmatrix p.vector p.random p.text p.optparse-applicative p.parallel
+              # market-live / market-backfill (vendored Hyperliquid client)
+              p.aeson p.websockets p.wuss p.http-client p.http-client-tls
             ]))
             pkgs.cabal-install
             pkgs.glibcLocales

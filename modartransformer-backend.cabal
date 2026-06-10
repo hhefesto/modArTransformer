@@ -109,6 +109,60 @@ executable market-train
   ghc-options:      -O2 -threaded -rtsopts "-with-rtsopts=-N -A64m -I0"
   default-language: Haskell2010
 
+-- Live mode: stream Hyperliquid trades (vendored client), learn ONLINE (one
+-- gradient step per completed 1m candle — the verified seqGradLoss morphism),
+-- and emit a paper-trading recommendation on EVERY trade (OPEN_LONG /
+-- OPEN_SHORT / CLOSE / FLIP / HOLD as JSONL).  --replay drives the same
+-- pipeline from a backfill CSV (fee-aware paper backtest, no network).
+executable market-live
+  main-is:          Live.hs
+  hs-source-dirs:   backend/market, backend/transformer, backend/data,
+                    backend/hyperliquid
+  other-modules:    AD, Tensor, Tape, Serialize, Transformer, Optimizer,
+                    Checkpoint, MarketTokenizer,
+                    Hyperliquid.Types, Hyperliquid.WebSocket, Hyperliquid.Info,
+                    Hyperliquid.Candles
+  default-extensions: NumericUnderscores
+  build-depends:    base >=4.17 && <5
+                  , hmatrix
+                  , random
+                  , directory
+                  , containers
+                  , vector
+                  , deepseq
+                  , time
+                  , text
+                  , stm
+                  , aeson
+                  , websockets
+                  , wuss
+                  , http-client
+                  , http-client-tls
+                  , optparse-applicative
+                  , parallel
+                  , bytestring
+                  , binary
+  ghc-options:      -O2 -threaded -rtsopts "-with-rtsopts=-N -A64m -I0"
+  default-language: Haskell2010
+
+-- Local historical/top-up OHLCV pull (vendored from chain-query): writes
+-- data/<coin>-<interval>.csv via the paginated candleSnapshot endpoint;
+-- idempotent re-runs append only newer candles.
+executable market-backfill
+  main-is:          Backfill.hs
+  hs-source-dirs:   backend/market, backend/hyperliquid
+  other-modules:    Hyperliquid.Types, Hyperliquid.Info, Hyperliquid.Candles
+  default-extensions: NumericUnderscores, OverloadedStrings
+  build-depends:    base >=4.17 && <5
+                  , aeson
+                  , directory
+                  , http-client
+                  , http-client-tls
+                  , text
+                  , time
+  ghc-options:      -O2 -threaded -rtsopts
+  default-language: Haskell2010
+
 -- Phase-5 Bradley probes over a trained market checkpoint (read-only):
 -- magnitude/Tsallis entropy landscape, Yoneda synonymy on copresheaves,
 -- numeric verification of the composition-law equality.

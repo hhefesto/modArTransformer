@@ -554,6 +554,30 @@ Ordering: 0 → 1 sequential; 2 and 3 independent (both need 1); 4 needs 2+3;
   equality numerically (max deviation 3e-61 — the chain rule; Bradley's
   "autoregressive models are enriched categories by construction").
   Writes `market-magnitude.csv`. PROBE OK.
+- **2026-06-09** — **Live mode (`market-live`) + local data pipeline**: the
+  Hyperliquid client is vendored into `backend/hyperliquid/` (origin:
+  chain-query@38a2f7c), so the whole pipeline is local — `market-backfill`
+  pulls/tops-up candle CSVs, and `market-live` streams trades in-process.
+  market-live warm-starts from a market-train checkpoint (+ .tok), aggregates
+  rolling 1m candles, takes **one online gradient step per candle close** (the
+  verified `seqGradLoss` + AdamW, constant lr, clip; checkpoint saved every
+  `--save-every` candles) and emits **a recommendation on every trade**
+  (provisional last token → copresheaf → expected return μ, P(up), entropy →
+  FLAT/LONG/SHORT paper state machine vs `--threshold-bps` net of
+  `--fee-bps` → OPEN_LONG/OPEN_SHORT/CLOSE/FLIP/HOLD as JSONL; position
+  persists across restarts).  `--replay CSV` drives the identical pipeline
+  offline (fee-aware paper backtest).  Verified: replay over the BTC file
+  (1527 candles, per-close online loss; θ=0.5bp exercises the state machine —
+  43 opens/42 closes, PnL accounting consistent) and a live smoke against the
+  real market (2 live candle closes trained; position resumed across
+  restart).  Recommendations only — no order placement.
+- **2026-06-09** — **Data reality check**: Hyperliquid's `candleSnapshot`
+  retains only **~5000 candles per interval** (1m ≈ 3.6 days, 15m ≈ 52 days,
+  1h ≈ 208 days) — a 180-day 1m pull is impossible from REST alone.  Archives
+  on disk: BTC 1m/15m/1h at the full available depth; the idempotent top-up
+  (cron `market-backfill`) accumulates 1m history beyond the API's retention
+  going forward.  Until the 1m archive deepens, offline training should use
+  15m/1h corpora (the live mode's online learning is unaffected).
 - **2026-06-09** — **Phase 2 foundation done, CUDA pending hardware**: `gpu/`
   is a separate flake (hasktorch pin, fully cache-fetched) whose
   `ConformanceG.hs` implements the sequence model with **our categorical

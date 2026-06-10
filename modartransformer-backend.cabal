@@ -46,6 +46,8 @@ executable backend-transformer-train
                   , deepseq
                   , time
                   , optparse-applicative
+                  , bytestring
+                  , binary
                   , parallel
   ghc-options:      -O2 -threaded -rtsopts "-with-rtsopts=-N -A64m -I0"
   default-language: Haskell2010
@@ -63,6 +65,8 @@ executable transformer-benchmarks
                   , deepseq
                   , directory
                   , optparse-applicative
+                  , bytestring
+                  , binary
   ghc-options:      -O2 -threaded -rtsopts
   default-language: Haskell2010
 
@@ -78,6 +82,50 @@ executable enriched-probe
                   , vector
                   , deepseq
                   , optparse-applicative
+  ghc-options:      -O2 -threaded -rtsopts
+  default-language: Haskell2010
+
+-- Train the VERIFIED sequence transformer (ParamsSeq, conformance-gated) as a
+-- next-token LM over quantized candle returns from chain-backfill CSVs.
+-- Walk-forward splits, train-window-only tokenizer artifact, binary
+-- checkpoints (+ best-by-val), interactive --prompt over the vocabulary.
+executable market-train
+  main-is:          Main.hs
+  hs-source-dirs:   backend/market, backend/transformer, backend/data
+  other-modules:    AD, Tensor, Tape, Serialize, Transformer, Optimizer,
+                    Checkpoint, MarketTokenizer
+  build-depends:    base >=4.17 && <5
+                  , hmatrix
+                  , random
+                  , directory
+                  , containers
+                  , vector
+                  , deepseq
+                  , time
+                  , optparse-applicative
+                  , parallel
+                  , bytestring
+                  , binary
+  ghc-options:      -O2 -threaded -rtsopts "-with-rtsopts=-N -A64m -I0"
+  default-language: Haskell2010
+
+-- Phase-5 Bradley probes over a trained market checkpoint (read-only):
+-- magnitude/Tsallis entropy landscape, Yoneda synonymy on copresheaves,
+-- numeric verification of the composition-law equality.
+executable market-seq-probe
+  main-is:          SeqProbe.hs
+  hs-source-dirs:   backend/market, backend/transformer, backend/data
+  other-modules:    AD, Tensor, Tape, Serialize, Transformer, Optimizer,
+                    Checkpoint, MarketTokenizer
+  build-depends:    base >=4.17 && <5
+                  , hmatrix
+                  , random
+                  , directory
+                  , vector
+                  , deepseq
+                  , optparse-applicative
+                  , bytestring
+                  , binary
   ghc-options:      -O2 -threaded -rtsopts
   default-language: Haskell2010
 
@@ -107,5 +155,7 @@ executable synth-lang-probe
                   , deepseq
                   , directory
                   , optparse-applicative
+                  , bytestring
+                  , binary
   ghc-options:      -O2 -threaded -rtsopts
   default-language: Haskell2010
